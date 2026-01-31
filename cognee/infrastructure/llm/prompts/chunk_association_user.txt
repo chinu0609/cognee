@@ -1,0 +1,9 @@
+Analyze these two document chunks for semantic association:  
+  
+Chunk 1 (ID: {chunk1_id}):  
+{chunk1_text}  
+  
+Chunk 2 (ID: {chunk2_id}):  
+{chunk2_text}  
+  
+Should these chunks be semantically associated? Provide your decision with confidence and reasoning.
