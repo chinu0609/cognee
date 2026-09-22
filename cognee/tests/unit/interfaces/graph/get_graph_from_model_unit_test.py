@@ -1,20 +1,16 @@
-import pytest
-from typing import List, Any
-from cognee.infrastructure.engine import DataPoint, Edge
+from typing import Any
 
+import pytest
+
+from cognee.infrastructure.engine import DataPoint, Edge
+from cognee.modules.engine.models import Entity as RealEntity
+from cognee.modules.engine.models import EntityType as RealEntityType
 from cognee.modules.graph.utils import get_graph_from_model
 
 
 class Document(DataPoint):
     path: str
     metadata: dict = {"index_fields": []}
-
-
-class DocumentChunk(DataPoint):
-    part_of: Document
-    text: str
-    contains: List["Entity"] = None
-    metadata: dict = {"index_fields": ["text"]}
 
 
 class EntityType(DataPoint):
@@ -28,9 +24,19 @@ class Entity(DataPoint):
     metadata: dict = {"index_fields": ["name"]}
 
 
+# Defined after Entity so the annotation needs no forward reference: a quoted
+# name inside a builtin generic is not resolvable when the model is copied
+# into another module on Python 3.10.
+class DocumentChunk(DataPoint):
+    part_of: Document
+    text: str
+    contains: list[Entity] = None
+    metadata: dict = {"index_fields": ["text"]}
+
+
 class Company(DataPoint):
     name: str
-    employees: List[Any] = None  # Allow flexible edge system with tuples
+    employees: list[Any] = None  # Allow flexible edge system with tuples
     metadata: dict = {"index_fields": ["name"]}
 
 
@@ -63,7 +69,7 @@ async def test_get_graph_from_model_simple_structure():
     assert len(nodes) == 2, f"Expected 2 nodes, got {len(nodes)}"
     assert len(edges) == 1, f"Expected 1 edges, got {len(edges)}"
 
-    edge_key = f"{str(entity.id)}_{str(entitytype.id)}_is_type"
+    edge_key = f"{entity.id!s}_{entitytype.id!s}_is_type"
     assert edge_key in added_edges, f"Edge {edge_key} not found"
 
 
@@ -162,6 +168,26 @@ async def test_get_graph_from_model_no_contains():
 
     assert len(nodes) == 2, f"Expected 2 nodes, got {len(nodes)}"
     assert len(edges) == 1, f"Expected 1 edge, got {len(edges)}"
+
+
+@pytest.mark.asyncio
+async def test_entity_relations_traversed_as_edges():
+    """Entity.relations List[(Edge, Entity)] entries are traversed as graph edges."""
+    entity_type = RealEntityType(name="Animal", description="Animal type")
+    cat = RealEntity(name="Cat", description="A cat", is_a=entity_type)
+    dog = RealEntity(name="Dog", description="A dog", is_a=entity_type)
+    cat.relations.append((Edge(relationship_type="friends_with"), dog))
+
+    nodes, edges = await get_graph_from_model(cat, {}, {}, {})
+
+    node_ids = {str(n.id) for n in nodes}
+    assert str(cat.id) in node_ids
+    assert str(dog.id) in node_ids
+    assert str(entity_type.id) in node_ids
+
+    rel_names = {e[2] for e in edges}
+    assert "friends_with" in rel_names
+    assert "is_a" in rel_names
 
 
 @pytest.mark.asyncio

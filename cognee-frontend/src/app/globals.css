@@ -1,31 +1,99 @@
-:root {
-  --max-width: 1100px;
-  --border-radius: 2px;
-  --font-mono: ui-monospace, Menlo, Monaco, "Cascadia Mono", "Segoe UI Mono",
-    "Roboto Mono", "Oxygen Mono", "Ubuntu Monospace", "Source Code Pro",
-    "Fira Mono", "Droid Sans Mono", "Courier New", monospace;
+@layer tailwind, mantine;
+@layer tailwind {
+  @import "tailwindcss";
+}
 
-  --button-padding: 14px 20px !important;
-  --button-border-radius: 100px !important;
-  --global-color-primary: #6510F4 !important;
-  --global-color-primary-active: #500cc5 !important;
-  --global-color-primary-text: white !important;
-  --global-color-secondary: #0DFF00 !important;
-  --global-background-default: #F4F4F4;
-  --textarea-default-color: #0D051C !important;
+@theme {
+  /* ── Brand ── */
+  --color-cognee-purple: #6510F4;
+  --color-cognee-purple-hover: #5A0ED6;
+  --color-cognee-purple-pressed: #4A0BAF;
+  --color-cognee-green: #0DFF00;
+  /* Lavender = canonical CTA accent across the dark hero / onboarding /
+     embedded-auth surfaces. Pair with #1e1e1c text. */
+  --color-cognee-lavender: #BC9BFF;
+  --color-cognee-lavender-text: #1e1e1c;
+  --color-cognee-lavender-hover: #A87CFF;
+  --color-cognee-lavender-tint-10: rgba(188,155,255,0.10);
+  --color-cognee-lavender-tint-20: rgba(188,155,255,0.20);
+  --color-cognee-lavender-tint-35: rgba(188,155,255,0.35);
+  --color-cognee-lavender-tint-60: rgba(188,155,255,0.60);
+
+  /* ── Surfaces ── */
+  --color-cognee-bg: #F4F4F4;
+  --color-cognee-hover: #F4F4F5;
+  --color-cognee-pressed: #E4E4E7;
+  --color-cognee-selected: #F0EDFF;
+  --color-cognee-selected-hover: #E8E2FD;
+  --color-cognee-disabled: #FAFAFA;
+
+  /* ── Borders ── */
+  --color-cognee-border: #E4E4E7;
+  --color-cognee-border-light: #E5E7EB;
+
+  /* ── Text (Zinc scale) ── */
+  --color-cognee-dark: #18181B;
+  --color-cognee-body: #3F3F46;
+  --color-cognee-secondary: #52525B;
+  --color-cognee-muted: #71717A;
+  --color-cognee-placeholder: #A1A1AA;
+  --color-cognee-text-disabled: #D4D4D8;
+
+  /* ── Dark app shell ──
+     The in-app surfaces run on the black grid base, not the light Zinc scale
+     above: `fg` is the canonical foreground there (use /55 for secondary text,
+     which is the lowest alpha that still clears WCAG AA on that background). */
+  --color-cognee-fg: #EDECEA;
+  --color-cognee-success: #22C55E;
+  --color-cognee-warning: #F59E0B;
+  --color-cognee-danger: #EF4444;
+  --color-cognee-danger-fg: #FF8A8A;
+
+  /* ── Typography ── */
+  --font-sans: "TWKLausanne", sans-serif;
+  --font-mono: ui-monospace, Menlo, Monaco, "Cascadia Mono", "Segoe UI Mono", "Roboto Mono", monospace;
+}
+
+:root {
+  --cognee-purple: #6510F4;
+  --cognee-green: #0DFF00;
+  --cognee-terminal-dot: #351A4B;
+}
+
+body {
+  /* Dark base with the 33px grid so route-transition loading states,
+     overscroll, and error boundaries match the app shell instead of
+     flashing the old light design. */
+  background-color: #000000;
+  background-image:
+    linear-gradient(rgba(244, 244, 244, 0.10) 1px, transparent 1px),
+    linear-gradient(90deg, rgba(244, 244, 244, 0.10) 1px, transparent 1px);
+  background-size: 33px 33px;
 }
 
 html,
 body {
-  height: 100%;
-  max-width: 100vw;
-  overflow-x: hidden;
-  background-color: var(--global-background-default);
+  font-family: "TWKLausanne", sans-serif;
+  font-weight: 300;
+  line-height: 1.25;
 }
 
-a {
-  color: inherit;
-  text-decoration: none;
+@font-face {
+  font-family: "TWKLausanne";
+  src:
+    url("/fonts/TWKLausanne-300.woff2") format("woff2"),
+    url("/fonts/TWKLausanne-300.woff") format("woff");
+  font-weight: 300;
+  font-style: normal;
+  font-display: swap;
 }
 
-@import "tailwindcss";
+@font-face {
+  font-family: "TWKLausanne";
+  src:
+    url("/fonts/TWKLausanne-700.woff2") format("woff2"),
+    url("/fonts/TWKLausanne-700.woff") format("woff");
+  font-weight: 700;
+  font-style: normal;
+  font-display: swap;
+}

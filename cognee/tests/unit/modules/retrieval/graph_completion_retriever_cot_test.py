@@ -1,13 +1,52 @@
-import pytest
-from unittest.mock import AsyncMock, patch, MagicMock
-from uuid import UUID
+import logging
+from unittest.mock import AsyncMock, MagicMock, patch
 
+import pytest
+
+from cognee.infrastructure.llm.LLMGateway import LLMGateway
+from cognee.modules.graph.cognee_graph.CogneeGraphElements import Edge
 from cognee.modules.retrieval.graph_completion_cot_retriever import (
     GraphCompletionCotRetriever,
     _as_answer_text,
 )
-from cognee.modules.graph.cognee_graph.CogneeGraphElements import Edge
-from cognee.infrastructure.llm.LLMGateway import LLMGateway
+from cognee.modules.retrieval.utils.completion import SessionPrompt
+
+logger = logging.getLogger(__name__)
+
+
+@pytest.fixture(autouse=True)
+def _no_real_llm_calls():
+    """Keep every test in this file off the network.
+
+    The CoT round's validation and follow-up prompts go through
+    ``batch_llm_completion`` -> ``LLMGateway.acreate_structured_output``.
+    Several tests here only patch the final ``generate_completion`` and let
+    that call escape to the real provider. In the full suite an earlier test
+    happened to leave a patched gateway behind; once the suite was sharded
+    the call went out for real, hit the provider's error, and was retried
+    under the 240-second floor until pytest-timeout killed it (300s per test,
+    on macOS and Windows where the accidental polluter is skipped). Patched
+    by object, not by dotted string: the LLMGateway class shadows its module,
+    so a string target lands on the class on Python 3.10.
+    """
+
+    async def _structured(text_input, system_prompt, response_model=str, **_):
+        # Honour the requested model: str prompts get a string, pydantic
+        # models get an unvalidated instance so isinstance checks hold.
+        if response_model is str or response_model is None:
+            return "reasoning"
+        try:
+            return response_model.model_construct()
+        except Exception:
+            logger.debug(
+                "Falling back after error in _no_real_llm_calls._structured", exc_info=True
+            )
+            return "reasoning"
+
+    with patch.object(
+        LLMGateway, "acreate_structured_output", new=AsyncMock(side_effect=_structured)
+    ):
+        yield
 
 
 @pytest.fixture
@@ -43,6 +82,7 @@ async def test_init_custom_params():
         validation_system_prompt_path="custom_validation_system.txt",
         followup_system_prompt_path="custom_followup_system.txt",
         followup_user_prompt_path="custom_followup_user.txt",
+        feedback_influence=0.25,
     )
 
     assert retriever.top_k == 10
@@ -52,6 +92,7 @@ async def test_init_custom_params():
     assert retriever.validation_system_prompt_path == "custom_validation_system.txt"
     assert retriever.followup_system_prompt_path == "custom_followup_system.txt"
     assert retriever.followup_user_prompt_path == "custom_followup_user.txt"
+    assert retriever.feedback_influence == 0.25
 
 
 @pytest.mark.asyncio
@@ -66,9 +107,9 @@ async def test_init_defaults():
 
 
 @pytest.mark.asyncio
-async def test_run_cot_completion_round_zero_with_context(mock_edge):
-    """Test _run_cot_completion round 0 with provided context."""
-    retriever = GraphCompletionCotRetriever()
+async def test_run_cot_completion_round_zero(mock_edge):
+    """Test _run_cot_completion round 0."""
+    retriever = GraphCompletionCotRetriever(max_iter=1)
 
     with (
         patch(
@@ -76,10 +117,9 @@ async def test_run_cot_completion_round_zero_with_context(mock_edge):
             return_value="Resolved context",
         ),
         patch(
-            "cognee.modules.retrieval.graph_completion_cot_retriever.generate_completion",
+            "cognee.modules.retrieval.utils.completion.generate_completion",
             return_value="Generated answer",
         ),
-        patch.object(retriever, "get_context", new_callable=AsyncMock, return_value=[mock_edge]),
         patch(
             "cognee.modules.retrieval.graph_completion_cot_retriever._as_answer_text",
             return_value="Generated answer",
@@ -92,6 +132,7 @@ async def test_run_cot_completion_round_zero_with_context(mock_edge):
             "cognee.modules.retrieval.graph_completion_cot_retriever.read_query_prompt",
             return_value="System prompt",
         ),
+        patch.object(retriever, "get_triplets", new_callable=AsyncMock, return_value=[[mock_edge]]),
         patch.object(
             LLMGateway,
             "acreate_structured_output",
@@ -100,59 +141,22 @@ async def test_run_cot_completion_round_zero_with_context(mock_edge):
         ),
     ):
         completion, context_text, triplets = await retriever._run_cot_completion(
-            query="test query",
-            context=[mock_edge],
-            max_iter=1,
+            query_batch=["test query"],
         )
 
-    assert completion == "Generated answer"
-    assert context_text == "Resolved context"
-    assert len(triplets) >= 1
-
-
-@pytest.mark.asyncio
-async def test_run_cot_completion_round_zero_without_context(mock_edge):
-    """Test _run_cot_completion round 0 without provided context."""
-    mock_graph_engine = AsyncMock()
-    mock_graph_engine.is_empty = AsyncMock(return_value=False)
-
-    retriever = GraphCompletionCotRetriever()
-
-    with (
-        patch(
-            "cognee.modules.retrieval.graph_completion_retriever.get_graph_engine",
-            return_value=mock_graph_engine,
-        ),
-        patch(
-            "cognee.modules.retrieval.graph_completion_retriever.brute_force_triplet_search",
-            return_value=[mock_edge],
-        ),
-        patch(
-            "cognee.modules.retrieval.graph_completion_retriever.resolve_edges_to_text",
-            return_value="Resolved context",
-        ),
-        patch(
-            "cognee.modules.retrieval.graph_completion_cot_retriever.generate_completion",
-            return_value="Generated answer",
-        ),
-    ):
-        completion, context_text, triplets = await retriever._run_cot_completion(
-            query="test query",
-            context=None,
-            max_iter=1,
-        )
-
-    assert completion == "Generated answer"
-    assert context_text == "Resolved context"
+    assert isinstance(completion, list)
+    assert len(completion) == 1
+    assert completion[0] == "Generated answer"
+    assert isinstance(context_text, list)
+    assert len(context_text) == 1
+    assert context_text[0] == "Resolved context"
     assert len(triplets) >= 1
 
 
 @pytest.mark.asyncio
 async def test_run_cot_completion_multiple_rounds(mock_edge):
     """Test _run_cot_completion with multiple rounds."""
-    retriever = GraphCompletionCotRetriever()
-
-    mock_edge2 = MagicMock(spec=Edge)
+    retriever = GraphCompletionCotRetriever(max_iter=2)
 
     with (
         patch(
@@ -160,14 +164,8 @@ async def test_run_cot_completion_multiple_rounds(mock_edge):
             return_value="Resolved context",
         ),
         patch(
-            "cognee.modules.retrieval.graph_completion_cot_retriever.generate_completion",
+            "cognee.modules.retrieval.utils.completion.generate_completion",
             return_value="Generated answer",
-        ),
-        patch.object(
-            retriever,
-            "get_context",
-            new_callable=AsyncMock,
-            side_effect=[[mock_edge], [mock_edge2]],
         ),
         patch(
             "cognee.modules.retrieval.graph_completion_cot_retriever.render_prompt",
@@ -192,22 +190,25 @@ async def test_run_cot_completion_multiple_rounds(mock_edge):
             "cognee.modules.retrieval.graph_completion_cot_retriever._as_answer_text",
             return_value="Generated answer",
         ),
+        patch.object(retriever, "get_triplets", new_callable=AsyncMock, return_value=[[mock_edge]]),
     ):
         completion, context_text, triplets = await retriever._run_cot_completion(
-            query="test query",
-            context=[mock_edge],
-            max_iter=2,
+            query_batch=["test query"]
         )
 
-    assert completion == "Generated answer"
-    assert context_text == "Resolved context"
+    assert isinstance(completion, list)
+    assert len(completion) == 1
+    assert completion[0] == "Generated answer"
+    assert isinstance(context_text, list)
+    assert len(context_text) == 1
+    assert context_text[0] == "Resolved context"
     assert len(triplets) >= 1
 
 
 @pytest.mark.asyncio
-async def test_run_cot_completion_with_conversation_history(mock_edge):
+async def test_run_cot_completion_with_session(mock_edge):
     """Test _run_cot_completion with conversation history."""
-    retriever = GraphCompletionCotRetriever()
+    retriever = GraphCompletionCotRetriever(max_iter=1)
 
     with (
         patch(
@@ -215,20 +216,21 @@ async def test_run_cot_completion_with_conversation_history(mock_edge):
             return_value="Resolved context",
         ),
         patch(
-            "cognee.modules.retrieval.graph_completion_cot_retriever.generate_completion",
+            "cognee.modules.retrieval.utils.completion.generate_completion",
             return_value="Generated answer",
         ) as mock_generate,
+        patch.object(retriever, "get_triplets", new_callable=AsyncMock, return_value=[[mock_edge]]),
     ):
-        completion, context_text, triplets = await retriever._run_cot_completion(
-            query="test query",
-            context=[mock_edge],
-            conversation_history="Previous conversation",
-            max_iter=1,
+        completion, _context_text, _triplets = await retriever._run_cot_completion(
+            query_batch=["test query"],
+            session=SessionPrompt(history="Previous conversation"),
         )
 
-    assert completion == "Generated answer"
+    assert isinstance(completion, list)
+    assert len(completion) == 1
+    assert completion[0] == "Generated answer"
     call_kwargs = mock_generate.call_args[1]
-    assert call_kwargs.get("conversation_history") == "Previous conversation"
+    assert call_kwargs.get("session") == SessionPrompt(history="Previous conversation")
 
 
 @pytest.mark.asyncio
@@ -239,7 +241,7 @@ async def test_run_cot_completion_with_response_model(mock_edge):
     class TestModel(BaseModel):
         answer: str
 
-    retriever = GraphCompletionCotRetriever()
+    retriever = GraphCompletionCotRetriever(response_model=TestModel, max_iter=1)
 
     with (
         patch(
@@ -247,25 +249,25 @@ async def test_run_cot_completion_with_response_model(mock_edge):
             return_value="Resolved context",
         ),
         patch(
-            "cognee.modules.retrieval.graph_completion_cot_retriever.generate_completion",
+            "cognee.modules.retrieval.utils.completion.generate_completion",
             return_value=TestModel(answer="Test answer"),
         ),
+        patch.object(retriever, "get_triplets", new_callable=AsyncMock, return_value=[[mock_edge]]),
     ):
-        completion, context_text, triplets = await retriever._run_cot_completion(
-            query="test query",
-            context=[mock_edge],
-            response_model=TestModel,
-            max_iter=1,
+        completion, _context_text, _triplets = await retriever._run_cot_completion(
+            query_batch=["test query"]
         )
 
-    assert isinstance(completion, TestModel)
-    assert completion.answer == "Test answer"
+    assert isinstance(completion, list)
+    assert len(completion) == 1
+    assert isinstance(completion[0], TestModel)
+    assert completion[0].answer == "Test answer"
 
 
 @pytest.mark.asyncio
-async def test_run_cot_completion_empty_conversation_history(mock_edge):
+async def test_run_cot_completion_without_session(mock_edge):
     """Test _run_cot_completion with empty conversation history."""
-    retriever = GraphCompletionCotRetriever()
+    retriever = GraphCompletionCotRetriever(max_iter=1)
 
     with (
         patch(
@@ -273,49 +275,57 @@ async def test_run_cot_completion_empty_conversation_history(mock_edge):
             return_value="Resolved context",
         ),
         patch(
-            "cognee.modules.retrieval.graph_completion_cot_retriever.generate_completion",
+            "cognee.modules.retrieval.utils.completion.generate_completion",
             return_value="Generated answer",
         ) as mock_generate,
+        patch.object(retriever, "get_triplets", new_callable=AsyncMock, return_value=[[mock_edge]]),
     ):
-        completion, context_text, triplets = await retriever._run_cot_completion(
-            query="test query",
-            context=[mock_edge],
-            conversation_history="",
-            max_iter=1,
+        completion, _context_text, _triplets = await retriever._run_cot_completion(
+            query_batch=["test query"],
         )
 
-    assert completion == "Generated answer"
-    # Verify conversation_history was passed as None when empty
+    assert isinstance(completion, list)
+    assert completion[0] == "Generated answer"
+    # No session layer: nothing is passed on.
     call_kwargs = mock_generate.call_args[1]
-    assert call_kwargs.get("conversation_history") is None
+    assert call_kwargs.get("session") is None
 
 
 @pytest.mark.asyncio
-async def test_get_completion_without_context(mock_edge):
-    """Test get_completion retrieves context when not provided."""
+async def test_get_completion(mock_edge):
+    """Test get_completion (CoT loop + final completion in get_completion_from_context)."""
     mock_graph_engine = AsyncMock()
     mock_graph_engine.is_empty = AsyncMock(return_value=False)
 
-    retriever = GraphCompletionCotRetriever()
+    unified_mock = AsyncMock()
+    unified_mock.graph = mock_graph_engine
+    unified_mock.vector = MagicMock()
+
+    retriever = GraphCompletionCotRetriever(max_iter=1)
 
     with (
         patch(
-            "cognee.modules.retrieval.graph_completion_retriever.get_graph_engine",
-            return_value=mock_graph_engine,
+            "cognee.modules.retrieval.graph_completion_retriever.get_unified_engine",
+            return_value=unified_mock,
         ),
         patch(
             "cognee.modules.retrieval.graph_completion_retriever.brute_force_triplet_search",
-            return_value=[mock_edge],
+            return_value=[[mock_edge]],
         ),
         patch(
             "cognee.modules.retrieval.graph_completion_retriever.resolve_edges_to_text",
             return_value="Resolved context",
         ),
         patch(
-            "cognee.modules.retrieval.graph_completion_cot_retriever.generate_completion",
+            "cognee.modules.retrieval.graph_completion_cot_retriever.generate_completion_batch",
+            new_callable=AsyncMock,
+            return_value=["Generated answer"],
+        ),
+        patch(
+            "cognee.modules.retrieval.graph_completion_retriever.generate_completion",
+            new_callable=AsyncMock,
             return_value="Generated answer",
         ),
-        patch.object(retriever, "get_context", new_callable=AsyncMock, return_value=[mock_edge]),
         patch(
             "cognee.modules.retrieval.graph_completion_cot_retriever._as_answer_text",
             return_value="Generated answer",
@@ -335,43 +345,20 @@ async def test_get_completion_without_context(mock_edge):
             side_effect=["validation_result", "followup_question"],
         ),
         patch(
-            "cognee.modules.retrieval.graph_completion_cot_retriever.CacheConfig"
+            "cognee.modules.retrieval.graph_completion_retriever.CacheConfig"
         ) as mock_cache_config,
     ):
         mock_config = MagicMock()
         mock_config.caching = False
         mock_cache_config.return_value = mock_config
 
-        completion = await retriever.get_completion("test query", max_iter=1)
-
-    assert isinstance(completion, list)
-    assert len(completion) == 1
-    assert completion[0] == "Generated answer"
-
-
-@pytest.mark.asyncio
-async def test_get_completion_with_provided_context(mock_edge):
-    """Test get_completion uses provided context."""
-    retriever = GraphCompletionCotRetriever()
-
-    with (
-        patch(
-            "cognee.modules.retrieval.graph_completion_retriever.resolve_edges_to_text",
-            return_value="Resolved context",
-        ),
-        patch(
-            "cognee.modules.retrieval.graph_completion_cot_retriever.generate_completion",
-            return_value="Generated answer",
-        ),
-        patch(
-            "cognee.modules.retrieval.graph_completion_cot_retriever.CacheConfig"
-        ) as mock_cache_config,
-    ):
-        mock_config = MagicMock()
-        mock_config.caching = False
-        mock_cache_config.return_value = mock_config
-
-        completion = await retriever.get_completion("test query", context=[mock_edge], max_iter=1)
+        objects = await retriever.get_retrieved_objects(query="test query")
+        context = await retriever.get_context_from_objects(
+            query="test query", retrieved_objects=objects
+        )
+        completion = await retriever.get_completion_from_context(
+            query="test query", retrieved_objects=objects, context=context
+        )
 
     assert isinstance(completion, list)
     assert len(completion) == 1
@@ -380,89 +367,40 @@ async def test_get_completion_with_provided_context(mock_edge):
 
 @pytest.mark.asyncio
 async def test_get_completion_with_session(mock_edge):
-    """Test get_completion with session caching enabled."""
+    """Test get_completion with session (SessionManager path for final completion)."""
     mock_graph_engine = AsyncMock()
     mock_graph_engine.is_empty = AsyncMock(return_value=False)
 
-    retriever = GraphCompletionCotRetriever()
+    unified_mock = AsyncMock()
+    unified_mock.graph = mock_graph_engine
+    unified_mock.vector = MagicMock()
+
+    retriever = GraphCompletionCotRetriever(session_id="test_session", max_iter=1)
 
     mock_user = MagicMock()
     mock_user.id = "test-user-id"
 
     with (
         patch(
-            "cognee.modules.retrieval.graph_completion_retriever.get_graph_engine",
-            return_value=mock_graph_engine,
+            "cognee.modules.retrieval.graph_completion_retriever.get_unified_engine",
+            return_value=unified_mock,
         ),
         patch(
             "cognee.modules.retrieval.graph_completion_retriever.brute_force_triplet_search",
-            return_value=[mock_edge],
+            return_value=[[mock_edge]],
         ),
         patch(
             "cognee.modules.retrieval.graph_completion_retriever.resolve_edges_to_text",
             return_value="Resolved context",
         ),
         patch(
-            "cognee.modules.retrieval.graph_completion_cot_retriever.get_conversation_history",
-            return_value="Previous conversation",
+            "cognee.modules.retrieval.graph_completion_retriever.get_session_manager",
+        ) as mock_get_sm,
+        patch(
+            "cognee.modules.retrieval.graph_completion_cot_retriever.generate_completion_batch",
+            new_callable=AsyncMock,
+            return_value=["Generated answer"],
         ),
-        patch(
-            "cognee.modules.retrieval.graph_completion_cot_retriever.summarize_text",
-            return_value="Context summary",
-        ),
-        patch(
-            "cognee.modules.retrieval.graph_completion_cot_retriever.generate_completion",
-            return_value="Generated answer",
-        ),
-        patch(
-            "cognee.modules.retrieval.graph_completion_cot_retriever.save_conversation_history",
-        ) as mock_save,
-        patch(
-            "cognee.modules.retrieval.graph_completion_cot_retriever.CacheConfig"
-        ) as mock_cache_config,
-        patch(
-            "cognee.modules.retrieval.graph_completion_cot_retriever.session_user"
-        ) as mock_session_user,
-    ):
-        mock_config = MagicMock()
-        mock_config.caching = True
-        mock_cache_config.return_value = mock_config
-        mock_session_user.get.return_value = mock_user
-
-        completion = await retriever.get_completion(
-            "test query", session_id="test_session", max_iter=1
-        )
-
-    assert isinstance(completion, list)
-    assert len(completion) == 1
-    assert completion[0] == "Generated answer"
-    mock_save.assert_awaited_once()
-
-
-@pytest.mark.asyncio
-async def test_get_completion_with_save_interaction(mock_edge):
-    """Test get_completion with save_interaction enabled."""
-    mock_graph_engine = AsyncMock()
-    mock_graph_engine.is_empty = AsyncMock(return_value=False)
-    mock_graph_engine.add_edges = AsyncMock()
-
-    retriever = GraphCompletionCotRetriever(save_interaction=True)
-
-    mock_node1 = MagicMock()
-    mock_node2 = MagicMock()
-    mock_edge.node1 = mock_node1
-    mock_edge.node2 = mock_node2
-
-    with (
-        patch(
-            "cognee.modules.retrieval.graph_completion_retriever.resolve_edges_to_text",
-            return_value="Resolved context",
-        ),
-        patch(
-            "cognee.modules.retrieval.graph_completion_cot_retriever.generate_completion",
-            return_value="Generated answer",
-        ),
-        patch.object(retriever, "get_context", new_callable=AsyncMock, return_value=[mock_edge]),
         patch(
             "cognee.modules.retrieval.graph_completion_cot_retriever._as_answer_text",
             return_value="Generated answer",
@@ -482,29 +420,34 @@ async def test_get_completion_with_save_interaction(mock_edge):
             side_effect=["validation_result", "followup_question"],
         ),
         patch(
-            "cognee.modules.retrieval.graph_completion_retriever.extract_uuid_from_node",
-            side_effect=[
-                UUID("550e8400-e29b-41d4-a716-446655440000"),
-                UUID("550e8400-e29b-41d4-a716-446655440001"),
-            ],
-        ),
-        patch(
-            "cognee.modules.retrieval.graph_completion_retriever.add_data_points",
-        ) as mock_add_data,
-        patch(
-            "cognee.modules.retrieval.graph_completion_cot_retriever.CacheConfig"
+            "cognee.modules.retrieval.graph_completion_retriever.CacheConfig"
         ) as mock_cache_config,
+        patch(
+            "cognee.modules.retrieval.graph_completion_retriever.session_user"
+        ) as mock_session_user,
     ):
         mock_config = MagicMock()
-        mock_config.caching = False
+        mock_config.caching = True
         mock_cache_config.return_value = mock_config
+        mock_session_user.get.return_value = mock_user
+        mock_sm = MagicMock()
+        mock_sm.get_session = AsyncMock(return_value="")
+        mock_sm.session_history_last_n = 10
+        mock_sm.generate_completion_with_session = AsyncMock(return_value="Generated answer")
+        mock_get_sm.return_value = mock_sm
 
-        # Pass context so save_interaction condition is met
-        completion = await retriever.get_completion("test query", context=[mock_edge], max_iter=1)
+        retrieved_objects = await retriever.get_retrieved_objects("test query")
+        context = await retriever.get_context_from_objects(
+            query="test query", retrieved_objects=retrieved_objects
+        )
+        completion = await retriever.get_completion_from_context(
+            query="test query", retrieved_objects=retrieved_objects, context=context
+        )
 
     assert isinstance(completion, list)
     assert len(completion) == 1
-    mock_add_data.assert_awaited_once()
+    assert completion[0] == "Generated answer"
+    mock_sm.generate_completion_with_session.assert_awaited_once()
 
 
 @pytest.mark.asyncio
@@ -518,35 +461,43 @@ async def test_get_completion_with_response_model(mock_edge):
     mock_graph_engine = AsyncMock()
     mock_graph_engine.is_empty = AsyncMock(return_value=False)
 
-    retriever = GraphCompletionCotRetriever()
+    unified_mock = AsyncMock()
+    unified_mock.graph = mock_graph_engine
+    unified_mock.vector = MagicMock()
+
+    retriever = GraphCompletionCotRetriever(response_model=TestModel, max_iter=1)
 
     with (
         patch(
-            "cognee.modules.retrieval.graph_completion_retriever.get_graph_engine",
-            return_value=mock_graph_engine,
+            "cognee.modules.retrieval.graph_completion_retriever.get_unified_engine",
+            return_value=unified_mock,
         ),
         patch(
             "cognee.modules.retrieval.graph_completion_retriever.brute_force_triplet_search",
-            return_value=[mock_edge],
+            return_value=[[mock_edge]],
         ),
         patch(
             "cognee.modules.retrieval.graph_completion_retriever.resolve_edges_to_text",
             return_value="Resolved context",
         ),
         patch(
-            "cognee.modules.retrieval.graph_completion_cot_retriever.generate_completion",
+            "cognee.modules.retrieval.utils.completion.generate_completion",
             return_value=TestModel(answer="Test answer"),
         ),
         patch(
-            "cognee.modules.retrieval.graph_completion_cot_retriever.CacheConfig"
+            "cognee.modules.retrieval.graph_completion_retriever.CacheConfig"
         ) as mock_cache_config,
     ):
         mock_config = MagicMock()
         mock_config.caching = False
         mock_cache_config.return_value = mock_config
 
-        completion = await retriever.get_completion(
-            "test query", response_model=TestModel, max_iter=1
+        objects = await retriever.get_retrieved_objects("test query")
+        context = await retriever.get_context_from_objects(
+            query="test query", retrieved_objects=objects
+        )
+        completion = await retriever.get_completion_from_context(
+            query="test query", retrieved_objects=objects, context=context
         )
 
     assert isinstance(completion, list)
@@ -560,30 +511,34 @@ async def test_get_completion_with_session_no_user_id(mock_edge):
     mock_graph_engine = AsyncMock()
     mock_graph_engine.is_empty = AsyncMock(return_value=False)
 
-    retriever = GraphCompletionCotRetriever()
+    unified_mock = AsyncMock()
+    unified_mock.graph = mock_graph_engine
+    unified_mock.vector = MagicMock()
+
+    retriever = GraphCompletionCotRetriever(max_iter=1)
 
     with (
         patch(
-            "cognee.modules.retrieval.graph_completion_retriever.get_graph_engine",
-            return_value=mock_graph_engine,
+            "cognee.modules.retrieval.graph_completion_retriever.get_unified_engine",
+            return_value=unified_mock,
         ),
         patch(
             "cognee.modules.retrieval.graph_completion_retriever.brute_force_triplet_search",
-            return_value=[mock_edge],
+            return_value=[[mock_edge]],
         ),
         patch(
             "cognee.modules.retrieval.graph_completion_retriever.resolve_edges_to_text",
             return_value="Resolved context",
         ),
         patch(
-            "cognee.modules.retrieval.graph_completion_cot_retriever.generate_completion",
+            "cognee.modules.retrieval.utils.completion.generate_completion",
             return_value="Generated answer",
         ),
         patch(
-            "cognee.modules.retrieval.graph_completion_cot_retriever.CacheConfig"
+            "cognee.modules.retrieval.graph_completion_retriever.CacheConfig"
         ) as mock_cache_config,
         patch(
-            "cognee.modules.retrieval.graph_completion_cot_retriever.session_user"
+            "cognee.modules.retrieval.graph_completion_retriever.session_user"
         ) as mock_session_user,
     ):
         mock_config = MagicMock()
@@ -591,54 +546,13 @@ async def test_get_completion_with_session_no_user_id(mock_edge):
         mock_cache_config.return_value = mock_config
         mock_session_user.get.return_value = None  # No user
 
-        completion = await retriever.get_completion("test query", max_iter=1)
-
-    assert isinstance(completion, list)
-    assert len(completion) == 1
-
-
-@pytest.mark.asyncio
-async def test_get_completion_with_save_interaction_no_context(mock_edge):
-    """Test get_completion with save_interaction but no context provided."""
-    retriever = GraphCompletionCotRetriever(save_interaction=True)
-
-    with (
-        patch(
-            "cognee.modules.retrieval.graph_completion_retriever.resolve_edges_to_text",
-            return_value="Resolved context",
-        ),
-        patch(
-            "cognee.modules.retrieval.graph_completion_cot_retriever.generate_completion",
-            return_value="Generated answer",
-        ),
-        patch.object(retriever, "get_context", new_callable=AsyncMock, return_value=[mock_edge]),
-        patch(
-            "cognee.modules.retrieval.graph_completion_cot_retriever._as_answer_text",
-            return_value="Generated answer",
-        ),
-        patch(
-            "cognee.modules.retrieval.graph_completion_cot_retriever.render_prompt",
-            return_value="Rendered prompt",
-        ),
-        patch(
-            "cognee.modules.retrieval.graph_completion_cot_retriever.read_query_prompt",
-            return_value="System prompt",
-        ),
-        patch.object(
-            LLMGateway,
-            "acreate_structured_output",
-            new_callable=AsyncMock,
-            side_effect=["validation_result", "followup_question"],
-        ),
-        patch(
-            "cognee.modules.retrieval.graph_completion_cot_retriever.CacheConfig"
-        ) as mock_cache_config,
-    ):
-        mock_config = MagicMock()
-        mock_config.caching = False
-        mock_cache_config.return_value = mock_config
-
-        completion = await retriever.get_completion("test query", context=None, max_iter=1)
+        objects = await retriever.get_retrieved_objects("test query")
+        context = await retriever.get_context_from_objects(
+            query="test query", retrieved_objects=objects
+        )
+        completion = await retriever.get_completion_from_context(
+            query="test query", retrieved_objects=objects, context=context
+        )
 
     assert isinstance(completion, list)
     assert len(completion) == 1
@@ -686,3 +600,164 @@ async def test_as_answer_text_with_basemodel():
     assert isinstance(result, str)
     assert "[Structured Response]" in result
     assert "test answer" in result
+
+
+@pytest.mark.asyncio
+async def test_get_completion_batch_queries(mock_edge):
+    """Test get_completion batch queries without provided context."""
+    mock_graph_engine = AsyncMock()
+    mock_graph_engine.is_empty = AsyncMock(return_value=False)
+
+    unified_mock = AsyncMock()
+    unified_mock.graph = mock_graph_engine
+    unified_mock.vector = MagicMock()
+
+    retriever = GraphCompletionCotRetriever(max_iter=1)
+
+    with (
+        patch(
+            "cognee.modules.retrieval.graph_completion_retriever.get_unified_engine",
+            return_value=unified_mock,
+        ),
+        patch(
+            "cognee.modules.retrieval.graph_completion_retriever.brute_force_triplet_search",
+            return_value=[[mock_edge], [mock_edge]],
+        ),
+        patch(
+            "cognee.modules.retrieval.graph_completion_retriever.resolve_edges_to_text",
+            return_value="Resolved context",
+        ),
+        patch(
+            "cognee.modules.retrieval.utils.completion.generate_completion",
+            return_value="Generated answer",
+        ),
+        patch(
+            "cognee.modules.retrieval.graph_completion_retriever.CacheConfig"
+        ) as mock_cache_config,
+    ):
+        mock_config = MagicMock()
+        mock_config.caching = False
+        mock_cache_config.return_value = mock_config
+
+        objects = await retriever.get_retrieved_objects(
+            query_batch=["test query 1", "test query 2"]
+        )
+        context = await retriever.get_context_from_objects(
+            query_batch=["test query 1", "test query 2"], retrieved_objects=objects
+        )
+        completion = await retriever.get_completion_from_context(
+            query_batch=["test query 1", "test query 2"], retrieved_objects=objects, context=context
+        )
+
+    assert isinstance(completion, list)
+    assert len(completion) == 2
+    assert completion[0] == "Generated answer" and completion[1] == "Generated answer"
+
+
+@pytest.mark.asyncio
+async def test_get_completion_batch_queries_with_response_model(mock_edge):
+    """Test get_completion of batch queries with custom response model."""
+    from pydantic import BaseModel
+
+    class TestModel(BaseModel):
+        answer: str
+
+    mock_graph_engine = AsyncMock()
+    mock_graph_engine.is_empty = AsyncMock(return_value=False)
+
+    unified_mock = AsyncMock()
+    unified_mock.graph = mock_graph_engine
+    unified_mock.vector = MagicMock()
+
+    retriever = GraphCompletionCotRetriever(response_model=TestModel, max_iter=1)
+
+    with (
+        patch(
+            "cognee.modules.retrieval.graph_completion_retriever.get_unified_engine",
+            return_value=unified_mock,
+        ),
+        patch(
+            "cognee.modules.retrieval.graph_completion_retriever.brute_force_triplet_search",
+            return_value=[[mock_edge], [mock_edge]],
+        ),
+        patch(
+            "cognee.modules.retrieval.graph_completion_retriever.resolve_edges_to_text",
+            return_value="Resolved context",
+        ),
+        patch(
+            "cognee.modules.retrieval.utils.completion.generate_completion",
+            return_value=TestModel(answer="Test answer"),
+        ),
+        patch(
+            "cognee.modules.retrieval.graph_completion_retriever.CacheConfig"
+        ) as mock_cache_config,
+    ):
+        mock_config = MagicMock()
+        mock_config.caching = False
+        mock_cache_config.return_value = mock_config
+
+        objects = await retriever.get_retrieved_objects(
+            query_batch=["test query 1", "test query 2"]
+        )
+        context = await retriever.get_context_from_objects(
+            query_batch=["test query 1", "test query 2"], retrieved_objects=objects
+        )
+        completion = await retriever.get_completion_from_context(
+            query_batch=["test query 1", "test query 2"], retrieved_objects=objects, context=context
+        )
+
+        assert isinstance(completion, list)
+        assert len(completion) == 2
+        assert isinstance(completion[0], TestModel) and isinstance(completion[1], TestModel)
+
+
+@pytest.mark.asyncio
+async def test_get_completion_batch_queries_duplicate_queries(mock_edge):
+    """Test get_completion batch queries without provided context."""
+    mock_graph_engine = AsyncMock()
+    mock_graph_engine.is_empty = AsyncMock(return_value=False)
+
+    unified_mock = AsyncMock()
+    unified_mock.graph = mock_graph_engine
+    unified_mock.vector = MagicMock()
+
+    retriever = GraphCompletionCotRetriever()
+
+    with (
+        patch(
+            "cognee.modules.retrieval.graph_completion_retriever.get_unified_engine",
+            return_value=unified_mock,
+        ),
+        patch(
+            "cognee.modules.retrieval.graph_completion_retriever.brute_force_triplet_search",
+            return_value=[[mock_edge], [mock_edge]],
+        ),
+        patch(
+            "cognee.modules.retrieval.graph_completion_retriever.resolve_edges_to_text",
+            return_value="Resolved context",
+        ),
+        patch(
+            "cognee.modules.retrieval.utils.completion.generate_completion",
+            return_value="Generated answer",
+        ),
+        patch(
+            "cognee.modules.retrieval.graph_completion_retriever.CacheConfig"
+        ) as mock_cache_config,
+    ):
+        mock_config = MagicMock()
+        mock_config.caching = False
+        mock_cache_config.return_value = mock_config
+
+        objects = await retriever.get_retrieved_objects(
+            query_batch=["test query 1", "test query 1"]
+        )
+        context = await retriever.get_context_from_objects(
+            query_batch=["test query 1", "test query 1"], retrieved_objects=objects
+        )
+        completion = await retriever.get_completion_from_context(
+            query_batch=["test query 1", "test query 1"], retrieved_objects=objects, context=context
+        )
+
+    assert isinstance(completion, list)
+    assert len(completion) == 2
+    assert completion[0] == "Generated answer" and completion[1] == "Generated answer"

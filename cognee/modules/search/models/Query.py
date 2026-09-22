@@ -1,6 +1,8 @@
-from uuid import uuid4
 from datetime import datetime, timezone
-from sqlalchemy import Column, DateTime, String, UUID
+from uuid import uuid4
+
+from sqlalchemy import UUID, Column, DateTime, String
+
 from cognee.infrastructure.databases.relational import Base
 
 
@@ -11,7 +13,15 @@ class Query(Base):
 
     text = Column(String)
     query_type = Column(String)
-    user_id = Column(UUID)
+    user_id = Column(UUID, index=True)
 
-    created_at = Column(DateTime(timezone=True), default=lambda: datetime.now(timezone.utc))
+    # Dataset the search was scoped to, recorded only when it resolved to
+    # exactly one. A search can fan out over several datasets (or every
+    # dataset the user can read), and those have no single dataset to
+    # attribute the query to, so they stay NULL.
+    dataset_id = Column(UUID, index=True, nullable=True)
+
+    created_at = Column(
+        DateTime(timezone=True), default=lambda: datetime.now(timezone.utc), index=True
+    )
     updated_at = Column(DateTime(timezone=True), onupdate=lambda: datetime.now(timezone.utc))

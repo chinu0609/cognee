@@ -1,26 +1,27 @@
 import asyncio
+import logging
 import os
-import pytest
 import pathlib
-import pytest_asyncio
-import cognee
 
+import pytest
+import pytest_asyncio
 from pydantic import BaseModel
-from cognee.low_level import setup, DataPoint
-from cognee.tasks.storage import add_data_points
+
+import cognee
+from cognee.low_level import DataPoint, setup
 from cognee.modules.chunking.models import DocumentChunk
 from cognee.modules.data.processing.document_types import TextDocument
 from cognee.modules.engine.models import Entity, EntityType
-from cognee.modules.retrieval.entity_extractors.DummyEntityExtractor import DummyEntityExtractor
-from cognee.modules.retrieval.context_providers.DummyContextProvider import DummyContextProvider
-from cognee.modules.retrieval.graph_completion_cot_retriever import GraphCompletionCotRetriever
-from cognee.modules.retrieval.graph_completion_retriever import GraphCompletionRetriever
+from cognee.modules.retrieval.completion_retriever import CompletionRetriever
 from cognee.modules.retrieval.graph_completion_context_extension_retriever import (
     GraphCompletionContextExtensionRetriever,
 )
-from cognee.modules.retrieval.EntityCompletionRetriever import EntityCompletionRetriever
+from cognee.modules.retrieval.graph_completion_cot_retriever import GraphCompletionCotRetriever
+from cognee.modules.retrieval.graph_completion_retriever import GraphCompletionRetriever
 from cognee.modules.retrieval.temporal_retriever import TemporalRetriever
-from cognee.modules.retrieval.completion_retriever import CompletionRetriever
+from cognee.tasks.storage import add_data_points
+
+logger = logging.getLogger(__name__)
 
 
 class TestAnswer(BaseModel):
@@ -43,84 +44,107 @@ def _assert_structured_answer(answer: list[TestAnswer]):
 
 async def _test_get_structured_graph_completion_cot():
     retriever = GraphCompletionCotRetriever()
+    query = "Who works at Figma?"
+
+    triplets = await retriever.get_retrieved_objects(query)
+    context = await retriever.get_context_from_objects(query=query, retrieved_objects=triplets)
 
     # Test with string response model (default)
-    string_answer = await retriever.get_completion("Who works at Figma?")
+    string_answer = await retriever.get_completion_from_context(
+        query=query, retrieved_objects=triplets, context=context
+    )
     _assert_string_answer(string_answer)
 
+    retriever.response_model = TestAnswer
     # Test with structured response model
-    structured_answer = await retriever.get_completion(
-        "Who works at Figma?", response_model=TestAnswer
+    triplets = await retriever.get_retrieved_objects(query)
+    structured_answer = await retriever.get_completion_from_context(
+        query=query, retrieved_objects=triplets, context=context
     )
     _assert_structured_answer(structured_answer)
 
 
 async def _test_get_structured_graph_completion():
     retriever = GraphCompletionRetriever()
+    query = "Who works at Figma?"
+
+    triplets = await retriever.get_retrieved_objects(query)
+    context = await retriever.get_context_from_objects(query=query, retrieved_objects=triplets)
 
     # Test with string response model (default)
-    string_answer = await retriever.get_completion("Who works at Figma?")
+    string_answer = await retriever.get_completion_from_context(
+        query=query, retrieved_objects=triplets, context=context
+    )
     _assert_string_answer(string_answer)
 
+    retriever.response_model = TestAnswer
     # Test with structured response model
-    structured_answer = await retriever.get_completion(
-        "Who works at Figma?", response_model=TestAnswer
+    structured_answer = await retriever.get_completion_from_context(
+        query=query, retrieved_objects=triplets, context=context
     )
     _assert_structured_answer(structured_answer)
 
 
 async def _test_get_structured_graph_completion_temporal():
     retriever = TemporalRetriever()
+    query = "When did Steve start working at Figma?"
 
     # Test with string response model (default)
-    string_answer = await retriever.get_completion("When did Steve start working at Figma?")
+    triplets = await retriever.get_retrieved_objects(query)
+    context = await retriever.get_context_from_objects(query=query, retrieved_objects=triplets)
+
+    # Test with string response model (default)
+    string_answer = await retriever.get_completion_from_context(
+        query=query, retrieved_objects=triplets, context=context
+    )
     _assert_string_answer(string_answer)
 
+    retriever.response_model = TestAnswer
     # Test with structured response model
-    structured_answer = await retriever.get_completion(
-        "When did Steve start working at Figma??", response_model=TestAnswer
+    structured_answer = await retriever.get_completion_from_context(
+        query=query, retrieved_objects=triplets, context=context
     )
     _assert_structured_answer(structured_answer)
 
 
 async def _test_get_structured_graph_completion_rag():
     retriever = CompletionRetriever()
+    query = "Where does Steve work?"
+
+    triplets = await retriever.get_retrieved_objects(query)
+    context = await retriever.get_context_from_objects(query=query, retrieved_objects=triplets)
 
     # Test with string response model (default)
-    string_answer = await retriever.get_completion("Where does Steve work?")
+    string_answer = await retriever.get_completion_from_context(
+        query=query, retrieved_objects=triplets, context=context
+    )
     _assert_string_answer(string_answer)
 
+    retriever.response_model = TestAnswer
     # Test with structured response model
-    structured_answer = await retriever.get_completion(
-        "Where does Steve work?", response_model=TestAnswer
+    structured_answer = await retriever.get_completion_from_context(
+        query=query, retrieved_objects=triplets, context=context
     )
     _assert_structured_answer(structured_answer)
 
 
 async def _test_get_structured_graph_completion_context_extension():
     retriever = GraphCompletionContextExtensionRetriever()
+    query = "Who works at Figma?"
+
+    triplets = await retriever.get_retrieved_objects(query)
+    context = await retriever.get_context_from_objects(query=query, retrieved_objects=triplets)
 
     # Test with string response model (default)
-    string_answer = await retriever.get_completion("Who works at Figma?")
-    _assert_string_answer(string_answer)
-
-    # Test with structured response model
-    structured_answer = await retriever.get_completion(
-        "Who works at Figma?", response_model=TestAnswer
+    string_answer = await retriever.get_completion_from_context(
+        query=query, retrieved_objects=triplets, context=context
     )
-    _assert_structured_answer(structured_answer)
-
-
-async def _test_get_structured_entity_completion():
-    retriever = EntityCompletionRetriever(DummyEntityExtractor(), DummyContextProvider())
-
-    # Test with string response model (default)
-    string_answer = await retriever.get_completion("Who is Albert Einstein?")
     _assert_string_answer(string_answer)
 
+    retriever.response_model = TestAnswer
     # Test with structured response model
-    structured_answer = await retriever.get_completion(
-        "Who is Albert Einstein?", response_model=TestAnswer
+    structured_answer = await retriever.get_completion_from_context(
+        query=query, retrieved_objects=triplets, context=context
     )
     _assert_structured_answer(structured_answer)
 
@@ -200,7 +224,7 @@ async def setup_test_environment():
         await cognee.prune.prune_data()
         await cognee.prune.prune_system(metadata=True)
     except Exception:
-        pass
+        logger.debug("Ignoring exception in setup_test_environment", exc_info=True)
 
 
 @pytest.mark.asyncio
@@ -211,4 +235,3 @@ async def test_get_structured_completion(setup_test_environment):
     await _test_get_structured_graph_completion_temporal()
     await _test_get_structured_graph_completion_rag()
     await _test_get_structured_graph_completion_context_extension()
-    await _test_get_structured_entity_completion()

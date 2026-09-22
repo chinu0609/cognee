@@ -1,31 +1,50 @@
 """
 End-to-end integration test for conversation history feature.
 
-Tests all retrievers that save conversation history to Redis cache:
-1. GRAPH_COMPLETION
-2. RAG_COMPLETION
-3. GRAPH_COMPLETION_COT
-4. GRAPH_COMPLETION_CONTEXT_EXTENSION
-5. GRAPH_SUMMARY_COMPLETION
-6. TEMPORAL
-7. TRIPLET_COMPLETION
+Covers retrievers that save conversation history (via SessionManager / cache):
+  GRAPH_COMPLETION, GRAPH_COMPLETION_DECOMPOSITION, RAG_COMPLETION, GRAPH_COMPLETION_COT,
+  GRAPH_COMPLETION_CONTEXT_EXTENSION, GRAPH_SUMMARY_COMPLETION, TEMPORAL, TRIPLET_COMPLETION.
+Uses cache_engine.get_latest_qa for legacy assertions and cognee.session.get_session for
+session history; e2e for session SDK (get_session, add_feedback, delete_feedback) at end.
 """
 
 import os
-import cognee
 import pathlib
-
-from cognee.infrastructure.databases.cache import get_cache_engine
-from cognee.infrastructure.databases.graph import get_graph_engine
-from cognee.modules.search.types import SearchType
-from cognee.shared.logging_utils import get_logger
-from cognee.modules.users.methods import get_default_user
 from collections import Counter
+from unittest.mock import patch
+
+import cognee
+from cognee.infrastructure.databases.cache import SessionQAEntry, get_cache_engine
+from cognee.infrastructure.databases.graph import get_graph_engine
+from cognee.infrastructure.session.session_turn import acknowledgement_for_turn, should_answer_turn
+from cognee.modules.retrieval import session_aware_completion
+from cognee.modules.search.types import SearchType
+from cognee.modules.users.methods import get_default_user
+from cognee.shared.logging_utils import get_logger
 
 logger = get_logger()
 
 
+def _assert_used_graph_element_ids_shape(entry: SessionQAEntry, expect_none: bool = False) -> None:
+    """Assert entry has used_graph_element_ids key and valid shape (or None for Triplet)."""
+    ids = entry.used_graph_element_ids
+    if expect_none:
+        assert ids is None, "Triplet retriever should store used_graph_element_ids as None"
+        return
+    if ids is None:
+        return
+    assert isinstance(ids, dict), "used_graph_element_ids must be dict or None"
+    assert set(ids.keys()) <= {"node_ids", "edge_ids"}, (
+        "used_graph_element_ids may only have node_ids and edge_ids"
+    )
+    for key in ("node_ids", "edge_ids"):
+        if key in ids:
+            assert isinstance(ids[key], list), f"{key} must be a list"
+            assert all(isinstance(x, str) for x in ids[key]), f"{key} must be list of str"
+
+
 async def main():
+    ######BEGIN: OLD SESSION FUNCTIONALITY (to be updated/removed in COG-3881; prefer pytest) ######
     data_directory_path = str(
         pathlib.Path(
             os.path.join(
@@ -80,11 +99,9 @@ async def main():
 
     history1 = await cache_engine.get_latest_qa(str(user.id), session_id_1, last_n=10)
     assert len(history1) == 1, f"Expected at least 1 Q&A in history, got {len(history1)}"
-    our_qa = [h for h in history1 if h["question"] == "What is TechCorp?"]
+    our_qa = [h for h in history1 if h.question == "What is TechCorp?"]
     assert len(our_qa) >= 1, "Expected to find 'What is TechCorp?' in history"
-    assert "answer" in our_qa[0] and "context" in our_qa[0], (
-        "Q&A should contain answer and context fields"
-    )
+    _assert_used_graph_element_ids_shape(our_qa[0])
 
     result2 = await cognee.search(
         query_type=SearchType.GRAPH_COMPLETION,
@@ -98,7 +115,7 @@ async def main():
 
     history2 = await cache_engine.get_latest_qa(str(user.id), session_id_1, last_n=10)
     our_questions = [
-        h for h in history2 if h["question"] in ["What is TechCorp?", "Tell me more about it"]
+        h for h in history2 if h.question in ["What is TechCorp?", "Tell me more about it"]
     ]
     assert len(our_questions) == 2, (
         f"Expected at least 2 Q&A pairs in history after 2 queries, got {len(our_questions)}"
@@ -117,7 +134,7 @@ async def main():
     )
 
     history3 = await cache_engine.get_latest_qa(str(user.id), session_id_2, last_n=10)
-    our_qa_session2 = [h for h in history3 if h["question"] == "What is DataCo?"]
+    our_qa_session2 = [h for h in history3 if h.question == "What is DataCo?"]
     assert len(our_qa_session2) == 1, "Session 2 should have 'What is DataCo?' question"
 
     result4 = await cognee.search(
@@ -130,9 +147,19 @@ async def main():
         f"Default session should return non-empty list, got: {result4!r}"
     )
 
-    history_default = await cache_engine.get_latest_qa(str(user.id), "default_session", last_n=10)
-    our_qa_default = [h for h in history_default if h["question"] == "Test default session"]
-    assert len(our_qa_default) == 1, "Should find 'Test default session' in default_session"
+    # An omitted session_id derives the dataset-scoped default: the search ran
+    # in this dataset's context, so the turn lands in default_session_<dataset_id>.
+    from cognee.modules.data.methods import get_datasets_by_name
+
+    dataset = (await get_datasets_by_name([dataset_name], user.id))[0]
+    derived_default_session = f"default_session_{dataset.id}"
+    history_default = await cache_engine.get_latest_qa(
+        str(user.id), derived_default_session, last_n=10
+    )
+    our_qa_default = [h for h in history_default if h.question == "Test default session"]
+    assert len(our_qa_default) == 1, (
+        f"Should find 'Test default session' in {derived_default_session}"
+    )
 
     session_id_rag = "test_session_rag"
 
@@ -147,8 +174,62 @@ async def main():
     )
 
     history_rag = await cache_engine.get_latest_qa(str(user.id), session_id_rag, last_n=10)
-    our_qa_rag = [h for h in history_rag if h["question"] == "What companies are mentioned?"]
+    our_qa_rag = [h for h in history_rag if h.question == "What companies are mentioned?"]
     assert len(our_qa_rag) == 1, "Should find RAG question in history"
+    _assert_used_graph_element_ids_shape(our_qa_rag[0])
+
+    session_id_decomposition = "test_session_decomposition"
+
+    result_decomposition = await cognee.search(
+        query_type=SearchType.GRAPH_COMPLETION_DECOMPOSITION,
+        query_text="What do you know about TechCorp and DataCo?",
+        session_id=session_id_decomposition,
+    )
+
+    assert isinstance(result_decomposition, list) and len(result_decomposition) > 0, (
+        "GRAPH_COMPLETION_DECOMPOSITION should return non-empty list, "
+        f"got: {result_decomposition!r}"
+    )
+
+    history_decomposition = await cache_engine.get_latest_qa(
+        str(user.id), session_id_decomposition, last_n=10
+    )
+    our_qa_decomposition = [
+        h
+        for h in history_decomposition
+        if h.question == "What do you know about TechCorp and DataCo?"
+    ]
+    assert len(our_qa_decomposition) == 1, "Should find decomposition question in history"
+    _assert_used_graph_element_ids_shape(our_qa_decomposition[0])
+
+    session_id_decomposition_combined = "test_session_decomposition_combined"
+
+    result_decomposition_combined = await cognee.search(
+        query_type=SearchType.GRAPH_COMPLETION_DECOMPOSITION,
+        query_text="What do you know about TechCorp and DataCo?",
+        session_id=session_id_decomposition_combined,
+        retriever_specific_config={"decomposition_mode": "combined_triplets_context"},
+    )
+
+    assert (
+        isinstance(result_decomposition_combined, list) and len(result_decomposition_combined) > 0
+    ), (
+        "GRAPH_COMPLETION_DECOMPOSITION combined mode should return non-empty list, "
+        f"got: {result_decomposition_combined!r}"
+    )
+
+    history_decomposition_combined = await cache_engine.get_latest_qa(
+        str(user.id), session_id_decomposition_combined, last_n=10
+    )
+    our_qa_decomposition_combined = [
+        h
+        for h in history_decomposition_combined
+        if h.question == "What do you know about TechCorp and DataCo?"
+    ]
+    assert len(our_qa_decomposition_combined) == 1, (
+        "Should find combined decomposition question in history"
+    )
+    _assert_used_graph_element_ids_shape(our_qa_decomposition_combined[0])
 
     session_id_cot = "test_session_cot"
 
@@ -163,8 +244,9 @@ async def main():
     )
 
     history_cot = await cache_engine.get_latest_qa(str(user.id), session_id_cot, last_n=10)
-    our_qa_cot = [h for h in history_cot if h["question"] == "What do you know about TechCorp?"]
+    our_qa_cot = [h for h in history_cot if h.question == "What do you know about TechCorp?"]
     assert len(our_qa_cot) == 1, "Should find CoT question in history"
+    _assert_used_graph_element_ids_shape(our_qa_cot[0])
 
     session_id_ext = "test_session_ext"
 
@@ -179,8 +261,9 @@ async def main():
     )
 
     history_ext = await cache_engine.get_latest_qa(str(user.id), session_id_ext, last_n=10)
-    our_qa_ext = [h for h in history_ext if h["question"] == "Tell me about DataCo"]
+    our_qa_ext = [h for h in history_ext if h.question == "Tell me about DataCo"]
     assert len(our_qa_ext) == 1, "Should find Context Extension question in history"
+    _assert_used_graph_element_ids_shape(our_qa_ext[0])
 
     session_id_summary = "test_session_summary"
 
@@ -196,9 +279,10 @@ async def main():
 
     history_summary = await cache_engine.get_latest_qa(str(user.id), session_id_summary, last_n=10)
     our_qa_summary = [
-        h for h in history_summary if h["question"] == "What are the key points about TechCorp?"
+        h for h in history_summary if h.question == "What are the key points about TechCorp?"
     ]
     assert len(our_qa_summary) == 1, "Should find Summary question in history"
+    _assert_used_graph_element_ids_shape(our_qa_summary[0])
 
     session_id_temporal = "test_session_temporal"
 
@@ -215,10 +299,9 @@ async def main():
     history_temporal = await cache_engine.get_latest_qa(
         str(user.id), session_id_temporal, last_n=10
     )
-    our_qa_temporal = [
-        h for h in history_temporal if h["question"] == "Tell me about the companies"
-    ]
+    our_qa_temporal = [h for h in history_temporal if h.question == "Tell me about the companies"]
     assert len(our_qa_temporal) == 1, "Should find Temporal question in history"
+    _assert_used_graph_element_ids_shape(our_qa_temporal[0])
 
     session_id_triplet = "test_session_triplet"
 
@@ -233,23 +316,15 @@ async def main():
     )
 
     history_triplet = await cache_engine.get_latest_qa(str(user.id), session_id_triplet, last_n=10)
-    our_qa_triplet = [
-        h for h in history_triplet if h["question"] == "What companies are mentioned?"
-    ]
+    our_qa_triplet = [h for h in history_triplet if h.question == "What companies are mentioned?"]
     assert len(our_qa_triplet) == 1, "Should find Triplet question in history"
+    _assert_used_graph_element_ids_shape(our_qa_triplet[0], expect_none=True)
 
-    from cognee.modules.retrieval.utils.session_cache import (
-        get_conversation_history,
+    # Session history via new session SDK (replaces legacy get_conversation_history)
+    entries = await cognee.session.get_session(session_id=session_id_1, user=user, last_n=10)
+    assert len(entries) >= 2, (
+        "Session should have at least 2 Q&A entries (two searches in session_id_1)"
     )
-
-    formatted_history = await get_conversation_history(session_id=session_id_1)
-
-    assert "Previous conversation:" in formatted_history, (
-        "Formatted history should contain 'Previous conversation:' header"
-    )
-    assert "QUESTION:" in formatted_history, "Formatted history should contain 'QUESTION:' prefix"
-    assert "CONTEXT:" in formatted_history, "Formatted history should contain 'CONTEXT:' prefix"
-    assert "ANSWER:" in formatted_history, "Formatted history should contain 'ANSWER:' prefix"
 
     from cognee.memify_pipelines.persist_sessions_in_knowledge_graph import (
         persist_sessions_in_knowledge_graph_pipeline,
@@ -279,9 +354,9 @@ async def main():
         f"Number of DocumentChunk ndoes in the graph is incorrect, found {type_counts.get('DocumentChunk', 0)} but there should be exactly 4 (2 original documents, 2 sessions)."
     )
 
-    from cognee.infrastructure.databases.vector.get_vector_engine import get_vector_engine
+    from cognee.infrastructure.databases.vector.get_vector_engine import get_vector_engine_async
 
-    vector_engine = get_vector_engine()
+    vector_engine = await get_vector_engine_async()
     collection_size = await vector_engine.search(
         collection_name="DocumentChunk_text",
         query_text="test",
@@ -290,6 +365,134 @@ async def main():
     assert len(collection_size) == 4, (
         f"DocumentChunk_text collection should have exactly 4 embeddings, found {len(collection_size)}"
     )
+    ######END: OLD SESSION FUNCTIONALITY######
+
+    ######E2E: NEW SESSION SDK (get_session, add_feedback, delete_feedback) ######
+    logger.info("Starting e2e tests for session SDK: get_session, add_feedback, delete_feedback")
+    session_id_sdk = "test_session_graph"  # reuse session that has Q&As from above
+    entries = await cognee.session.get_session(session_id=session_id_sdk, user=user, last_n=10)
+    assert len(entries) >= 2, (
+        f"Expected at least 2 entries for session {session_id_sdk!r}, got {len(entries)}"
+    )
+    latest = entries[-1]
+    assert latest.qa_id, "Latest entry should have qa_id"
+    qa_id_for_feedback = latest.qa_id
+
+    ok_add = await cognee.session.add_feedback(
+        session_id=session_id_sdk,
+        qa_id=qa_id_for_feedback,
+        feedback_text="E2E test feedback",
+        feedback_score=5,
+        user=user,
+    )
+    assert ok_add is True, "add_feedback should return True"
+
+    entries_after_add = await cognee.session.get_session(
+        session_id=session_id_sdk, user=user, last_n=10
+    )
+    latest_after = next((e for e in entries_after_add if e.qa_id == qa_id_for_feedback), None)
+    assert latest_after is not None, "Entry with qa_id should exist after add_feedback"
+    assert latest_after.feedback_text == "E2E test feedback", "feedback_text should be set"
+    assert latest_after.feedback_score == 5, "feedback_score should be 5"
+
+    ok_del = await cognee.session.delete_feedback(
+        session_id=session_id_sdk, qa_id=qa_id_for_feedback, user=user
+    )
+    assert ok_del is True, "delete_feedback should return True"
+
+    entries_after_del = await cognee.session.get_session(
+        session_id=session_id_sdk, user=user, last_n=10
+    )
+    latest_after_del = next((e for e in entries_after_del if e.qa_id == qa_id_for_feedback), None)
+    assert latest_after_del is not None, "Entry should still exist after delete_feedback"
+    assert latest_after_del.feedback_text is None, "feedback_text should be cleared"
+    assert latest_after_del.feedback_score is None, "feedback_score should be cleared"
+    logger.info("Session SDK e2e tests (get_session, add_feedback, delete_feedback) passed")
+    ###### END E2E: NEW SESSION SDK #####
+
+    ###### E2E: Automatic feedback detection (when caching and auto_feedback enabled) ######
+    # Runs in the default concurrent mode: every session turn, answered or not, must land
+    # in QA history, so a feedback-only message is stored as its own acknowledgement entry
+    # rather than silently dropped or answered as a normal question.
+    logger.info("Starting e2e tests for automatic feedback detection")
+    session_id_autofeedback = "test_session_autofeedback"
+    await cognee.search(
+        query_type=SearchType.GRAPH_COMPLETION,
+        query_text="What is TechCorp?",
+        session_id=session_id_autofeedback,
+    )
+    analyses = []
+    analyze_turn = session_aware_completion.analyze_turn
+
+    async def observe_analysis(snapshot):
+        analysis = await analyze_turn(snapshot)
+        analyses.append(analysis)
+        return analysis
+
+    # Observe the real LLM analysis without changing the retrieval or cache paths.
+    with patch.object(session_aware_completion, "analyze_turn", side_effect=observe_analysis):
+        result_autofeedback = await cognee.search(
+            query_type=SearchType.GRAPH_COMPLETION,
+            query_text="Thanks, that was really helpful!",
+            session_id=session_id_autofeedback,
+        )
+    assert len(analyses) == 1, "Concurrent feedback analysis must run exactly once"
+    [feedback_analysis] = analyses
+    assert not should_answer_turn(feedback_analysis, has_previous_qa=True), (
+        "The feedback-only message should route to an acknowledgement"
+    )
+    assert result_autofeedback is not None, (
+        "Second search (feedback-like message) should return a result"
+    )
+    entries_autofeedback = await cognee.session.get_session(
+        session_id=session_id_autofeedback, user=user, last_n=10
+    )
+    assert len(entries_autofeedback) == 2, (
+        "A feedback-only message must still be recorded as its own QA entry; "
+        f"expected 2 entries, got {len(entries_autofeedback)}"
+    )
+    first_entry_autofeedback, second_entry_autofeedback = entries_autofeedback
+    assert first_entry_autofeedback.question == "What is TechCorp?", (
+        "First entry must be the original question"
+    )
+    assert second_entry_autofeedback.question == "Thanks, that was really helpful!", (
+        "Feedback-only turn's raw message must be stored as the QA entry's question"
+    )
+    stored_answer_autofeedback = second_entry_autofeedback.answer or ""
+    assert stored_answer_autofeedback, (
+        "Feedback-only turn must store an acknowledgement as the QA entry's answer"
+    )
+    # Two different contracts, and a regression could satisfy either one alone,
+    # so both are pinned.
+    #
+    # Shape (from dev): a no-answer turn claims no retrieval and no served
+    # guidance -- its used_* fields stay None -- while the answered first turn
+    # recorded its graph ids. Text bounds proved flaky here: a valid
+    # acknowledgement can run long and echo the subject.
+    assert first_entry_autofeedback.used_graph_element_ids, (
+        "Answered turn must record the graph elements its answer used"
+    )
+    assert second_entry_autofeedback.used_graph_element_ids is None, (
+        "Feedback-only turn must not claim retrieval: storing the generated answer "
+        "would carry its used_graph_element_ids; "
+        f"got {second_entry_autofeedback.used_graph_element_ids}"
+    )
+    assert not second_entry_autofeedback.used_session_context_ids, (
+        "Feedback-only turn must not claim served guidance"
+    )
+    # Text: the stored answer IS the analysis output, not the independently
+    # generated answer that was discarded. Truthiness alone would not catch that
+    # -- the generated answer is truthy too.
+    expected_ack = acknowledgement_for_turn(feedback_analysis.response_to_user)
+    assert stored_answer_autofeedback == expected_ack, (
+        "Feedback-only turn must store the analysis acknowledgement, not the generated answer"
+    )
+    assert getattr(second_entry_autofeedback, "feedback_text", None) is None
+    assert getattr(second_entry_autofeedback, "feedback_score", None) is None
+    logger.info(
+        "Automatic feedback detection e2e passed: feedback-only turn stored as its own QA entry",
+    )
+    ###### END E2E: Automatic feedback detection #####
 
     await cognee.prune.prune_data()
     await cognee.prune.prune_system(metadata=True)

@@ -23,6 +23,7 @@ You can contribute to **cognee** in many ways:
 - 🔍 Reviewing pull requests
 - 🛠️ Contributing code or tests
 - 🌐 Helping other users
+- 📇 Adding an entry to the [Integrations Hub or Use-Case Gallery](docs/contributing/add-catalog-entry.md)
 
 ## 📫 Get in Touch
 
@@ -99,40 +100,41 @@ git checkout -b feature/your-feature-name
 
 ### Running Tests
 
-Rename `.env.example` into `.env` and provide your OPENAI_API_KEY as LLM_API_KEY
+Copy `.env.template` to `.env` and provide your OPENAI_API_KEY as LLM_API_KEY
 
 ```shell
 uv run python cognee/tests/test_library.py
 ```
 
+### Minimal Docker Compose Try-out
+
+If you want a quick local smoke test before changing code, bring up the default API server with Docker Compose:
+
+```shell
+cp .env.template .env
+# edit .env and set LLM_API_KEY
+docker compose up
+```
+
+Useful optional profiles:
+
+```shell
+docker compose --profile ui up        # frontend on http://localhost:3000
+docker compose --profile mcp up       # MCP server on http://localhost:8001
+docker compose --profile postgres up  # Postgres/PGVector
+docker compose --profile neo4j up     # Neo4j
+```
+
+See the [Run with Docker](README.md#run-with-docker) section in the README for more details.
+
 ### Running Simple Example
 
-Rename `.env.example` into `.env` and provide your OPENAI_API_KEY as LLM_API_KEY
+Copy `.env.template` to `.env` and provide your OPENAI_API_KEY as LLM_API_KEY
 
 Make sure to run ```shell uv sync ``` in the root cloned folder or set up a virtual environment to run cognee
 
 ```shell
-python examples/python/simple_example.py
-```
-or
-
-```shell
-uv run python examples/python/simple_example.py
-```
-
-### Running Simple Example
-
-Change .env.example into .env and provide your OPENAI_API_KEY as LLM_API_KEY
-
-Make sure to run ```shell uv sync ``` in the root cloned folder or set up a virtual environment to run cognee
-
-```shell
-python cognee/cognee/examples/python/simple_example.py
-```
-or
-
-```shell
-uv run python cognee/cognee/examples/python/simple_example.py
+uv run python examples/guides/simple_cognee_example.py
 ```
 
 ## 4. 📤 Submitting Changes
@@ -149,6 +151,17 @@ git push origin feature/your-feature-name
    - Go to the [**cognee** repository](https://github.com/topoteretes/cognee) or [cognee community repository](https://github.com/topoteretes/cognee-community)
    - Click "Compare & Pull Request" and open a PR against dev branch
    - Fill in the PR template with details about your changes
+   - You MUST provide screenshots of unit and integration tests passing on your machine. We can't merge PRs otherwise
+
+### Changelog Entries
+
+This repository has no `CHANGELOG.md`. Release notes are compiled from merged PR titles when a
+release is cut (see `.github/docs/release.md`), so your PR title *is* the changelog entry: use the
+conventional `type: Summary` form described above and make it understandable on its own.
+
+> **Reviewers are auto-routed.** Cognee uses a [`CODEOWNERS`](.github/CODEOWNERS)
+> file to request reviews automatically based on the directories your PR touches.
+> No manual ping required — the right person will get notified when you open the PR.
 
 ## 5. 📜 Developer Certificate of Origin (DCO)
 

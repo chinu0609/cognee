@@ -2,19 +2,24 @@
 
 import asyncio
 import json
-from typing import List, Optional, Any, Dict, Type, Tuple
+from collections import Counter
+from typing import Any
 from uuid import UUID
 
-from cognee.infrastructure.databases.exceptions import MissingQueryParameterError
-from cognee.infrastructure.databases.exceptions import MutuallyExclusiveQueryParametersError
+from cognee.infrastructure.databases.exceptions import (
+    MissingQueryParameterError,
+    MutuallyExclusiveQueryParametersError,
+)
 from cognee.infrastructure.databases.graph.neptune_driver.adapter import NeptuneGraphDB
-from cognee.infrastructure.databases.vector.vector_db_interface import VectorDBInterface
-from cognee.infrastructure.engine import DataPoint
-from cognee.modules.storage.utils import JSONEncoder
-from cognee.shared.logging_utils import get_logger
 from cognee.infrastructure.databases.vector.embeddings.EmbeddingEngine import EmbeddingEngine
 from cognee.infrastructure.databases.vector.models.PayloadSchema import PayloadSchema
 from cognee.infrastructure.databases.vector.models.ScoredResult import ScoredResult
+from cognee.infrastructure.databases.vector.vector_db_interface import VectorDBInterface
+from cognee.infrastructure.engine import DataPoint
+from cognee.modules.graph.models.EdgeType import EdgeType
+from cognee.modules.graph.utils.prepare_edges_for_storage import get_edge_retrieval_text
+from cognee.modules.storage.utils import JSONEncoder
+from cognee.shared.logging_utils import get_logger
 
 logger = get_logger("NeptuneAnalyticsAdapter")
 
@@ -26,12 +31,22 @@ class IndexSchema(DataPoint):
     Attributes:
     - id: A string representing the unique identifier for the data point.
     - text: A string representing the content of the data point.
+    - belongs_to_set: A list of node names this data point belongs to, used for filtering.
     - metadata: A dictionary with default index fields for the schema, currently configured
     to include 'text'.
     """
 
     id: str
     text: str
+    # Optional reference scalars carried for the search "Evidence" feature.
+    # They stay None for non-chunk data points, so this schema remains
+    # compatible with every indexed DataPoint type.
+    document_id: str | None = None
+    document_name: str | None = None
+    chunk_index: int | None = None
+    source_chunk_id: str | None = None
+    importance_weight: float | None = 0.5
+    belongs_to_set: list[str] = []
     metadata: dict = {"index_fields": ["text"]}
 
 
@@ -55,11 +70,11 @@ class NeptuneAnalyticsAdapter(NeptuneGraphDB, VectorDBInterface):
     def __init__(
         self,
         graph_id: str,
-        embedding_engine: Optional[EmbeddingEngine] = None,
-        region: Optional[str] = None,
-        aws_access_key_id: Optional[str] = None,
-        aws_secret_access_key: Optional[str] = None,
-        aws_session_token: Optional[str] = None,
+        embedding_engine: EmbeddingEngine | None = None,
+        region: str | None = None,
+        aws_access_key_id: str | None = None,
+        aws_secret_access_key: str | None = None,
+        aws_session_token: str | None = None,
     ):
         """
         Initialize the Neptune Analytics hybrid adapter.
@@ -84,9 +99,7 @@ class NeptuneAnalyticsAdapter(NeptuneGraphDB, VectorDBInterface):
 
         # Add vector-specific attributes
         self.embedding_engine = embedding_engine
-        logger.info(
-            f'Initialized Neptune Analytics hybrid adapter for graph: "{graph_id}" in region: "{self.region}"'
-        )
+        logger.info('Initialized Neptune Analytics hybrid adapter in region: "%s"', self.region)
 
     # VectorDBInterface methods implementation
 
@@ -96,7 +109,7 @@ class NeptuneAnalyticsAdapter(NeptuneGraphDB, VectorDBInterface):
         No operation is performed and None will be returned here,
         because the concept of connection is not applicable in this context.
         """
-        return None
+        return
 
     async def embed_data(self, data: list[str]) -> list[list[float]]:
         """
@@ -132,7 +145,7 @@ class NeptuneAnalyticsAdapter(NeptuneGraphDB, VectorDBInterface):
     async def create_collection(
         self,
         collection_name: str,
-        payload_schema: Optional[PayloadSchema] = None,
+        payload_schema: PayloadSchema | None = None,
     ):
         """
         Neptune Analytics stores vector on a node level, so create_collection() implements interface for compliance but performs no operations when called.
@@ -144,16 +157,15 @@ class NeptuneAnalyticsAdapter(NeptuneGraphDB, VectorDBInterface):
             - payload_schema (Optional[PayloadSchema]): An optional schema for the payloads
               within this collection. (default None)
         """
-        pass
 
     async def get_collection(self, collection_name: str):
         """
         This method is part of the default implementation but not defined in the interface.
         No operation is performed here because the concept of collection is not applicable in NeptuneAnalytics vector store.
         """
-        return None
+        return
 
-    async def create_data_points(self, collection_name: str, data_points: List[DataPoint]):
+    async def create_data_points(self, collection_name: str, data_points: list[DataPoint]):
         """
         Insert new data points into the specified collection, by first inserting the node itself on the graph,
         then execute neptune.algo.vectors.upsert() to insert the corresponded embedding.
@@ -178,12 +190,12 @@ class NeptuneAnalyticsAdapter(NeptuneGraphDB, VectorDBInterface):
             # Fetch properties
             properties = self._serialize_properties(data_point.model_dump())
             properties[self._COLLECTION_PREFIX] = collection_name
-            params = dict(
-                node_id=str(node_id),
-                properties=properties,
-                embedding=data_vector,
-                collection_name=collection_name,
-            )
+            params = {
+                "node_id": str(node_id),
+                "properties": properties,
+                "embedding": data_vector,
+                "collection_name": collection_name,
+            }
 
             # Compose the query and send
             query_string = (
@@ -201,8 +213,11 @@ class NeptuneAnalyticsAdapter(NeptuneGraphDB, VectorDBInterface):
             try:
                 self._client.query(query_string, params)
             except Exception as e:
+                logger.debug(
+                    "Ignoring exception in NeptuneAnalyticsAdapter.create_data_points",
+                    exc_info=True,
+                )
                 self._na_exception_handler(e, query_string)
-        pass
 
     async def retrieve(self, collection_name: str, data_point_ids: list[str]):
         """
@@ -215,7 +230,7 @@ class NeptuneAnalyticsAdapter(NeptuneGraphDB, VectorDBInterface):
             - data_point_ids (list[str]): A list of IDs of the data points to retrieve.
         """
         # Do the fetch for each node
-        params = dict(node_ids=data_point_ids, collection_name=collection_name)
+        params = {"node_ids": data_point_ids, "collection_name": collection_name}
         query_string = (
             f"MATCH( n :{self._VECTOR_NODE_LABEL}) "
             f"WHERE id(n) in $node_ids AND "
@@ -225,17 +240,28 @@ class NeptuneAnalyticsAdapter(NeptuneGraphDB, VectorDBInterface):
 
         try:
             result = self._client.query(query_string, params)
-            return [self._get_scored_result(item) for item in result]
+            return [
+                ScoredResult(
+                    id=(item.get("payload") or {}).get("~id"),
+                    payload=(item.get("payload") or {}).get("~properties"),
+                    score=0,
+                )
+                for item in result
+            ]
         except Exception as e:
+            logger.debug("Ignoring exception in NeptuneAnalyticsAdapter.retrieve", exc_info=True)
             self._na_exception_handler(e, query_string)
 
     async def search(
         self,
         collection_name: str,
-        query_text: Optional[str] = None,
-        query_vector: Optional[List[float]] = None,
-        limit: Optional[int] = None,
+        query_text: str | None = None,
+        query_vector: list[float] | None = None,
+        limit: int | None = None,
         with_vector: bool = False,
+        include_payload: bool = False,
+        node_name: list[str] | None = None,
+        node_name_filter_operator: str = "OR",
     ):
         """
         Perform a search in the specified collection using either a text query or a vector
@@ -251,6 +277,13 @@ class NeptuneAnalyticsAdapter(NeptuneGraphDB, VectorDBInterface):
             - limit (int): The maximum number of results to return from the search.
             - with_vector (bool): Whether to return the vector representations with search
               results, this is not supported for Neptune Analytics backend at the moment.
+            - include_payload (bool): When True, fetch full node properties and populate
+              ``ScoredResult.payload``. When False (default), only node IDs are returned and
+              ``payload`` is set to None, reducing data transfer.
+            - node_name (Optional[List[str]]): Optional list of set names to filter results
+              by ``belongs_to_set`` membership.
+            - node_name_filter_operator (str): ``"OR"`` (default) matches nodes belonging to
+              any of the ``node_name`` values; ``"AND"`` requires membership in all of them.
 
         Returns:
         --------
@@ -285,7 +318,7 @@ class NeptuneAnalyticsAdapter(NeptuneGraphDB, VectorDBInterface):
             embedding = data_vectors[0]
 
         # Compose the parameters map
-        params = dict(embedding=embedding, param_topk=limit)
+        params = {"embedding": embedding, "param_topk": limit}
         # Compose the query
         query_string = f"""
         CALL neptune.algo.vectors.topKByEmbeddingWithFiltering({{
@@ -297,29 +330,61 @@ class NeptuneAnalyticsAdapter(NeptuneGraphDB, VectorDBInterface):
         YIELD node, score
         """
 
+        # Filter by belongs_to_set if node_name is provided
+        if node_name:
+            escaped_names = [name.replace("'", "\\'") for name in node_name]
+            name_list = ", ".join(f"'{name}'" for name in escaped_names)
+
+            if node_name_filter_operator == "OR":
+                query_string += f"""
+                WITH node, score
+                WHERE any(name IN node.belongs_to_set WHERE name IN [{name_list}])
+                """
+            else:
+                query_string += f"""
+                WITH node, score
+                WHERE all(name IN node.belongs_to_set WHERE name IN [{name_list}])
+                """
+
         if with_vector:
             query_string += """
-        WITH node, score, id(node) as node_id
+        WITH node, score
         MATCH (n)
         WHERE id(n) = id(node)
         CALL neptune.algo.vectors.get(n)
         YIELD embedding
-        RETURN node as payload, score, embedding
         """
 
-        else:
-            query_string += """
-        RETURN node as payload, score
-        """
+        payload_part = "node as payload" if include_payload else "id(node) as node_id"
+        embedding_part = ", embedding" if with_vector else ""
+        query_string += f"RETURN {payload_part}, score{embedding_part}"
 
         try:
             query_response = self._client.query(query_string, params)
-            return [self._get_scored_result(item=item, with_score=True) for item in query_response]
+            results = []
+            for item in query_response:
+                payload_obj = item.get("payload") or {}
+                results.append(
+                    ScoredResult(
+                        id=payload_obj.get("~id") if include_payload else item.get("node_id"),
+                        payload=payload_obj.get("~properties") if include_payload else None,
+                        score=item.get("score", 0),
+                    )
+                )
+            return results
         except Exception as e:
+            logger.debug("Ignoring exception in NeptuneAnalyticsAdapter.search", exc_info=True)
             self._na_exception_handler(e, query_string)
 
     async def batch_search(
-        self, collection_name: str, query_texts: List[str], limit: int, with_vectors: bool = False
+        self,
+        collection_name: str,
+        query_texts: list[str],
+        limit: int,
+        with_vectors: bool = False,
+        include_payload: bool = False,
+        node_name: list[str] | None = None,
+        node_name_filter_operator: str = "OR",
     ):
         """
         Perform a batch search using multiple text queries against a collection.
@@ -342,7 +407,16 @@ class NeptuneAnalyticsAdapter(NeptuneGraphDB, VectorDBInterface):
         data_vectors = await self.embedding_engine.embed_text(query_texts)
         return await asyncio.gather(
             *[
-                self.search(collection_name, None, vector, limit, with_vectors)
+                self.search(
+                    collection_name,
+                    None,
+                    vector,
+                    limit,
+                    with_vectors,
+                    include_payload=include_payload,
+                    node_name=node_name,
+                    node_name_filter_operator=node_name_filter_operator,
+                )
                 for vector in data_vectors
             ]
         )
@@ -358,7 +432,7 @@ class NeptuneAnalyticsAdapter(NeptuneGraphDB, VectorDBInterface):
               points.
             - data_point_ids (list[str]): A list of IDs of the data points to delete.
         """
-        params = dict(node_ids=data_point_ids, collection_name=collection_name)
+        params = {"node_ids": data_point_ids, "collection_name": collection_name}
         query_string = (
             f"MATCH (n :{self._VECTOR_NODE_LABEL}) "
             f"WHERE id(n) IN $node_ids "
@@ -368,8 +442,10 @@ class NeptuneAnalyticsAdapter(NeptuneGraphDB, VectorDBInterface):
         try:
             self._client.query(query_string, params)
         except Exception as e:
+            logger.debug(
+                "Ignoring exception in NeptuneAnalyticsAdapter.delete_data_points", exc_info=True
+            )
             self._na_exception_handler(e, query_string)
-        pass
 
     async def create_vector_index(self, index_name: str, index_property_name: str):
         """
@@ -403,6 +479,14 @@ class NeptuneAnalyticsAdapter(NeptuneGraphDB, VectorDBInterface):
                 IndexSchema(
                     id=str(data_point.id),
                     text=getattr(data_point, data_point.metadata["index_fields"][0]),
+                    # Reference scalars for search "Evidence". Pulled via getattr
+                    # so non-chunk data points (which lack these fields) simply
+                    # fall back to None instead of raising.
+                    document_id=getattr(data_point, "document_id", None),
+                    document_name=getattr(data_point, "document_name", None),
+                    chunk_index=getattr(data_point, "chunk_index", None),
+                    source_chunk_id=getattr(data_point, "source_chunk_id", None),
+                    importance_weight=getattr(data_point, "importance_weight", None),
                 )
                 for data_point in data_points
             ],
@@ -414,7 +498,6 @@ class NeptuneAnalyticsAdapter(NeptuneGraphDB, VectorDBInterface):
         """
         # Run actual truncate
         self._client.query(f"MATCH (n :{self._VECTOR_NODE_LABEL}) DETACH DELETE n")
-        pass
 
     async def is_empty(self) -> bool:
         query = """
@@ -422,22 +505,8 @@ class NeptuneAnalyticsAdapter(NeptuneGraphDB, VectorDBInterface):
         RETURN true
         LIMIT 1;
         """
-        query_result = await self._client.query(query)
+        query_result = self._client.query(query)
         return len(query_result) == 0
-
-    @staticmethod
-    def _get_scored_result(
-        item: dict, with_vector: bool = False, with_score: bool = False
-    ) -> ScoredResult:
-        """
-        Util method to simplify the object creation of ScoredResult base on incoming NX payload response.
-        """
-        return ScoredResult(
-            id=item.get("payload").get("~id"),
-            payload=item.get("payload").get("~properties"),
-            score=item.get("score") if with_score else 0,
-            vector=item.get("embedding") if with_vector else None,
-        )
 
     def _na_exception_handler(self, ex, query_string: str):
         """
@@ -455,3 +524,96 @@ class NeptuneAnalyticsAdapter(NeptuneGraphDB, VectorDBInterface):
             raise ValueError(
                 "Neptune Analytics requires an embedder defined to make vector operations"
             )
+
+    async def add_nodes_with_vectors(self, data_points: list[DataPoint]) -> None:
+        """Add nodes to the graph and index their embeddable fields as vector data points.
+
+        This is the hybrid write path for Neptune Analytics: graph nodes are inserted
+        via ``add_nodes`` and vector embeddings are stored as COGNEE_NODE entries
+        grouped by ``(TypeName, field_name)`` collection.
+
+        Parameters:
+        -----------
+            - data_points (List[DataPoint]): Nodes to insert. Each node's
+              ``metadata["index_fields"]`` controls which fields are embedded.
+        """
+        if not data_points:
+            return
+
+        await self.add_nodes(data_points)
+
+        # Group by (type_name, field_name) to build one collection per field.
+        groups: dict[tuple[str, str], list[DataPoint]] = {}
+        for dp in data_points:
+            if not hasattr(dp, "metadata") or not dp.metadata:
+                continue
+            type_name = type(dp).__name__
+            for field_name in dp.metadata.get("index_fields", []):
+                if getattr(dp, field_name, None) is None:
+                    continue
+                key = (type_name, field_name)
+                groups.setdefault(key, []).append(dp)
+
+        for (type_name, field_name), points in groups.items():
+            await self.create_vector_index(type_name, field_name)
+            index_schemas = [
+                IndexSchema(
+                    id=str(dp.id),
+                    text=getattr(dp, field_name),
+                    document_id=getattr(dp, "document_id", None),
+                    document_name=getattr(dp, "document_name", None),
+                    chunk_index=getattr(dp, "chunk_index", None),
+                    source_chunk_id=getattr(dp, "source_chunk_id", None),
+                    importance_weight=getattr(dp, "importance_weight", None),
+                    belongs_to_set=dp.belongs_to_set or [],
+                )
+                for dp in points
+            ]
+            await self.create_data_points(f"{type_name}_{field_name}", index_schemas)
+
+    async def add_edges_with_vectors(
+        self, edges: list[tuple[str, str, str, dict[str, Any]]]
+    ) -> None:
+        """Add edges to the graph and index unique relationship types as vector data points.
+
+        Graph edges are inserted via ``add_edges``. Each distinct relationship type
+        (or ``edge_text`` when present in edge properties) is embedded and stored as a
+        COGNEE_NODE in the ``EdgeType_relationship_name`` collection, matching the
+        behaviour of the non-hybrid ``index_graph_edges`` task.
+
+        Parameters:
+        -----------
+            - edges (List[Tuple]): Edges in ``(source_id, target_id, rel_name, props)``
+              format, as produced by ``get_graph_from_model``.
+        """
+        if not edges:
+            return
+
+        await self.add_edges(edges)
+
+        # Collect unique edge texts for embedding.
+        edge_texts = []
+        for edge in edges:
+            props = edge[3] if len(edge) > 3 and edge[3] else {}
+            edge_text = get_edge_retrieval_text(props.get("edge_text"), edge[2])
+            if edge_text:
+                edge_texts.append(edge_text)
+
+        edge_type_counts = Counter(edge_texts)
+        if not edge_type_counts:
+            return
+
+        await self.create_vector_index("EdgeType", "relationship_name")
+        index_schemas = [
+            IndexSchema(
+                id=str(EdgeType.id_for(text)),
+                text=text,
+                belongs_to_set=[],
+            )
+            for text in edge_type_counts
+        ]
+        await self.create_data_points("EdgeType_relationship_name", index_schemas)
+
+    async def run_migrations(self):
+        """Run Neptune Analytics adapter migrations (currently no-op)."""
+        return

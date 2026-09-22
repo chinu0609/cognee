@@ -1,17 +1,20 @@
 import asyncio
-from typing import Type
 from uuid import uuid5
+
 from pydantic import BaseModel
 
-from cognee.tasks.summarization.exceptions import InvalidSummaryInputsError
-from cognee.modules.chunking.models.DocumentChunk import DocumentChunk
 from cognee.infrastructure.llm.extraction import extract_summary
+from cognee.infrastructure.llm.pipeline_stage import pipeline_stage
+from cognee.modules.chunking.models.DocumentChunk import DocumentChunk
 from cognee.modules.cognify.config import get_cognify_config
+from cognee.modules.pipelines.tasks.task import task_summary
+from cognee.tasks.summarization.exceptions import InvalidSummaryInputsError
 from cognee.tasks.summarization.models import TextSummary
 
 
+@task_summary("Summarized {n} chunk(s)")
 async def summarize_text(
-    data_chunks: list[DocumentChunk], summarization_model: Type[BaseModel] = None
+    data_chunks: list[DocumentChunk], summarization_model: type[BaseModel] | None = None
 ):
     """
     Summarize the text contained in the provided data chunks.
@@ -49,15 +52,19 @@ async def summarize_text(
         cognee_config = get_cognify_config()
         summarization_model = cognee_config.summarization_model
 
-    chunk_summaries = await asyncio.gather(
-        *[extract_summary(chunk.text, summarization_model) for chunk in data_chunks]
-    )
+    with pipeline_stage("summarization"):
+        chunk_summaries = await asyncio.gather(
+            *[extract_summary(chunk.text, summarization_model) for chunk in data_chunks]
+        )
 
     summaries = [
         TextSummary(
             id=uuid5(chunk.id, "TextSummary"),
             made_from=chunk,
+            source_chunk_id=str(chunk.id),
+            belongs_to_set=chunk.belongs_to_set,
             text=chunk_summaries[chunk_index].summary,
+            importance_weight=chunk.importance_weight,
         )
         for (chunk_index, chunk) in enumerate(data_chunks)
     ]

@@ -1,9 +1,11 @@
-import os
-from typing import List
 import csv
-from cognee.infrastructure.loaders.LoaderInterface import LoaderInterface
+import os
+from typing import Any
+
 from cognee.infrastructure.files.storage import get_file_storage, get_storage_config
 from cognee.infrastructure.files.utils.get_file_metadata import get_file_metadata
+from cognee.infrastructure.loaders.LoaderInterface import LoaderInterface, LoaderResult
+from cognee.infrastructure.loaders.store_derived_text import store_derived_text
 
 
 class CsvLoader(LoaderInterface):
@@ -11,24 +13,21 @@ class CsvLoader(LoaderInterface):
     Core CSV file loader that handles basic CSV file formats.
     """
 
+    loader_name = "csv_loader"
+
     @property
-    def supported_extensions(self) -> List[str]:
+    def supported_extensions(self) -> list[str]:
         """Supported text file extensions."""
         return [
             "csv",
         ]
 
     @property
-    def supported_mime_types(self) -> List[str]:
+    def supported_mime_types(self) -> list[str]:
         """Supported MIME types for text content."""
         return [
             "text/csv",
         ]
-
-    @property
-    def loader_name(self) -> str:
-        """Unique identifier for this loader."""
-        return "csv_loader"
 
     def can_handle(self, extension: str, mime_type: str) -> bool:
         """
@@ -41,12 +40,13 @@ class CsvLoader(LoaderInterface):
         Returns:
             True if file can be handled, False otherwise
         """
-        if extension in self.supported_extensions and mime_type in self.supported_mime_types:
-            return True
+        return bool(
+            extension in self.supported_extensions and mime_type in self.supported_mime_types
+        )
 
-        return False
-
-    async def load(self, file_path: str, encoding: str = "utf-8", **kwargs):
+    async def load(
+        self, file_path: str, encoding: str = "utf-8", **kwargs: Any
+    ) -> "str | LoaderResult":
         """
         Load and process the csv file.
 
@@ -74,20 +74,21 @@ class CsvLoader(LoaderInterface):
         row_texts = []
         row_index = 1
 
-        with open(file_path, "r", encoding=encoding, newline="") as file:
+        with open(file_path, encoding=encoding, newline="") as file:
             reader = csv.DictReader(file)
             for row in reader:
-                pairs = [f"{str(k)}: {str(v)}" for k, v in row.items()]
+                pairs = [f"{k!s}: {v!s}" for k, v in row.items()]
                 row_text = ", ".join(pairs)
                 row_texts.append(f"Row {row_index}:\n{row_text}\n")
                 row_index += 1
 
         content = "\n".join(row_texts)
 
+        if not kwargs.get("persist", True):
+            return content
+
         storage_config = get_storage_config()
         data_root_directory = storage_config["data_root_directory"]
         storage = get_file_storage(data_root_directory)
 
-        full_file_path = await storage.store(storage_file_name, content)
-
-        return full_file_path
+        return await store_derived_text(storage, storage_file_name, content)

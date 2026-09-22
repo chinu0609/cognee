@@ -42,14 +42,16 @@ Usage:
        # Async function for embedding with auto-retry
 """
 
-import time
 import asyncio
 import random
+import time
 from functools import wraps
+
 from limits import RateLimitItemPerMinute, storage
 from limits.strategies import MovingWindowRateLimiter
-from cognee.shared.logging_utils import get_logger
+
 from cognee.infrastructure.llm.config import get_llm_config
+from cognee.shared.logging_utils import get_logger
 
 logger = get_logger()
 
@@ -108,7 +110,7 @@ class llm_rate_limiter:
 
     def __new__(cls):
         if cls._instance is None:
-            cls._instance = super(llm_rate_limiter, cls).__new__(cls)
+            cls._instance = super().__new__(cls)
             cls._instance._initialized = False
         return cls._instance
 
@@ -443,7 +445,7 @@ def sleep_and_retry_sync(
                     )
                     logger.warning(
                         f"Rate limit hit, retrying in {backoff_time:.2f}s "
-                        f"(attempt {attempt}/{max_retries}): {str(e)}"
+                        f"(attempt {attempt}/{max_retries}): {e!s}"
                     )
                     time.sleep(backoff_time)
 
@@ -528,7 +530,7 @@ def sleep_and_retry_async(
                     )
                     logger.warning(
                         f"Rate limit hit, retrying in {backoff_time:.2f}s "
-                        f"(attempt {attempt}/{max_retries}): {str(e)}"
+                        f"(attempt {attempt}/{max_retries}): {e!s}"
                     )
                     await asyncio.sleep(backoff_time)
 

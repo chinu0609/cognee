@@ -1,14 +1,16 @@
+from collections.abc import AsyncGenerator
 from uuid import UUID
-from sqlalchemy import select
-from typing import AsyncGenerator
 
-from cognee.shared.logging_utils import get_logger
-from cognee.modules.data.processing.document_types.Document import Document
-from cognee.modules.data.models import Data
+from sqlalchemy import select
+
 from cognee.infrastructure.databases.relational import get_relational_engine
-from cognee.modules.chunking.TextChunker import TextChunker
 from cognee.modules.chunking.Chunker import Chunker
-from cognee.tasks.documents.exceptions import InvalidChunkSizeError, InvalidChunkerError
+from cognee.modules.chunking.TextChunker import TextChunker
+from cognee.modules.data.models import Data
+from cognee.modules.data.processing.document_types.Document import Document
+from cognee.modules.pipelines.tasks.task import task_summary
+from cognee.shared.logging_utils import get_logger
+from cognee.tasks.documents.exceptions import InvalidChunkerError, InvalidChunkSizeError
 
 
 async def update_document_token_count(document_id: UUID, token_count: int) -> None:
@@ -26,6 +28,7 @@ async def update_document_token_count(document_id: UUID, token_count: int) -> No
             raise ValueError(f"Document with id {document_id} not found.")
 
 
+@task_summary("Extracted {n} chunk(s)")
 async def extract_chunks_from_documents(
     documents: list[Document],
     max_chunk_size: int,

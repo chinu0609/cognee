@@ -1,4 +1,6 @@
-from typing import List, Dict, Any
+from typing import Any
+
+from cognee.modules.retrieval.base_retriever import BaseRetriever
 from cognee.modules.retrieval.completion_retriever import CompletionRetriever
 from cognee.modules.retrieval.graph_completion_context_extension_retriever import (
     GraphCompletionContextExtensionRetriever,
@@ -9,10 +11,7 @@ from cognee.modules.retrieval.graph_summary_completion_retriever import (
     GraphSummaryCompletionRetriever,
 )
 
-from cognee.modules.retrieval.base_retriever import BaseRetriever
-
-
-retriever_options: Dict[str, Any] = {
+retriever_options: dict[str, Any] = {
     "cognee_graph_completion": GraphCompletionRetriever,
     "cognee_graph_completion_cot": GraphCompletionCotRetriever,
     "cognee_graph_completion_context_extension": GraphCompletionContextExtensionRetriever,
@@ -24,24 +23,23 @@ retriever_options: Dict[str, Any] = {
 class AnswerGeneratorExecutor:
     async def question_answering_non_parallel(
         self,
-        questions: List[Dict[str, str]],
+        questions: list[dict[str, str]],
         retriever: BaseRetriever,
-    ) -> List[Dict[str, str]]:
+    ) -> list[dict[str, str]]:
         answers = []
         for instance in questions:
             query_text = instance["question"]
             correct_answer = instance["answer"]
 
-            retrieval_context = await retriever.get_context(query_text)
-            search_results = await retriever.get_completion(query_text, retrieval_context)
+            retrieved_objects = await retriever.get_retrieved_objects(query=query_text)
+            retrieval_context = await retriever.get_context_from_objects(
+                query=query_text, retrieved_objects=retrieved_objects
+            )
+            search_results = await retriever.get_completion_from_context(
+                query=query_text, retrieved_objects=retrieved_objects, context=retrieval_context
+            )
 
             ############
-            #:TODO This is a quick fix until we don't structure retriever results properly but lets not leave it like this...this is needed now due to the changed combined retriever structure..
-            if isinstance(retrieval_context, list):
-                retrieval_context = await retriever.convert_retrieved_objects_to_context(
-                    triplets=retrieval_context
-                )
-
             if isinstance(search_results, str):
                 search_results = [search_results]
             #############

@@ -1,10 +1,11 @@
 import os
 import pathlib
+
 import cognee
 from cognee.modules.search.operations import get_history
+from cognee.modules.search.types import SearchType
 from cognee.modules.users.methods import get_default_user
 from cognee.shared.logging_utils import get_logger
-from cognee.modules.search.types import SearchType
 
 logger = get_logger()
 
@@ -43,12 +44,12 @@ async def main():
     }
 
     task_1_graph_config = {
-        "graph_database_provider": "kuzu",
-        "graph_file_path": "kuzu1.db",
+        "graph_database_provider": "ladybug",
+        "graph_file_path": "ladybug1.db",
     }
     task_2_graph_config = {
-        "graph_database_provider": "kuzu",
-        "graph_file_path": "kuzu2.db",
+        "graph_database_provider": "ladybug",
+        "graph_file_path": "ladybug2.db",
     }
 
     # schedule both cognify calls concurrently

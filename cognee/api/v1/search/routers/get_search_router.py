@@ -1,37 +1,136 @@
-from uuid import UUID
-from typing import Optional, Union, List, Any
 from datetime import datetime
-from pydantic import Field
-from fastapi import Depends, APIRouter
-from fastapi.responses import JSONResponse
-from fastapi.encoders import jsonable_encoder
+from typing import Any
+from uuid import UUID
 
-from cognee.modules.search.types import SearchType, SearchResult
-from cognee.api.DTO import InDTO, OutDTO
-from cognee.modules.users.exceptions.exceptions import PermissionDeniedError, UserNotFoundError
-from cognee.modules.users.models import User
-from cognee.modules.search.operations import get_history
-from cognee.modules.users.methods import get_authenticated_user
-from cognee.shared.utils import send_telemetry
+from fastapi import APIRouter, Depends, status
+from fastapi.encoders import jsonable_encoder
+from fastapi.responses import JSONResponse
+from pydantic import Field
+
 from cognee import __version__ as cognee_version
-from cognee.infrastructure.databases.exceptions import DatabaseNotCreatedError
-from cognee.exceptions import CogneeValidationError
+from cognee.api.DTO import ErrorResponse, InDTO, OutDTO
+from cognee.exceptions import CogneeApiError
+from cognee.modules.search.operations import get_history
+from cognee.modules.search.types import SearchResult, SearchType
+from cognee.modules.users.methods import get_authenticated_user
+from cognee.modules.users.models import User
+from cognee.shared.logging_utils import get_logger
+from cognee.shared.usage_logger import log_usage
+from cognee.shared.utils import send_telemetry
+
+logger = get_logger()
 
 
 # Note: Datasets sent by name will only map to datasets owned by the request sender
 #       To search for datasets not owned by the request sender dataset UUID is needed
 class SearchPayloadDTO(InDTO):
-    search_type: SearchType = Field(default=SearchType.GRAPH_COMPLETION)
-    datasets: Optional[list[str]] = Field(default=None)
-    dataset_ids: Optional[list[UUID]] = Field(default=None, examples=[[]])
-    query: str = Field(default="What is in the document?")
-    system_prompt: Optional[str] = Field(
+    search_type: SearchType = Field(
+        default=SearchType.HYBRID_COMPLETION,
+        description=(
+            "Retrieval strategy. Common values: HYBRID_COMPLETION (default, passages + entities +"
+            " LLM answer), GRAPH_COMPLETION (graph context + LLM answer), CODE (deterministic"
+            " code graph), RAG_COMPLETION, CHUNKS, SUMMARIES, TEMPORAL, FEELING_LUCKY"
+            " (auto-select), AGENTIC_COMPLETION (enables skills/tools/max_iter)."
+        ),
+    )
+    datasets: list[str] | None = Field(
+        default=None,
+        examples=[["default_dataset"]],
+        description=(
+            "Dataset names to search. Names only resolve to datasets owned by the caller;"
+            " use dataset_ids for datasets shared with you."
+        ),
+    )
+    dataset_ids: list[UUID] | None = Field(
+        default=None,
+        examples=[None],
+        description=(
+            "Dataset UUIDs to search (required for datasets shared with you)."
+            " When provided, the datasets name list is ignored."
+        ),
+    )
+    query: str = Field(
+        ...,
+        examples=["What is in the document?"],
+        description="The question to answer. Required; there is no default query.",
+    )
+    system_prompt: str | None = Field(
         default="Answer the question using the provided context. Be as brief as possible."
     )
-    node_name: Optional[list[str]] = Field(default=None, example=[])
-    top_k: Optional[int] = Field(default=10)
-    only_context: bool = Field(default=False)
-    verbose: bool = Field(default=False)
+    node_name: list[str] | None = Field(
+        default=None,
+        examples=[None],
+        description=(
+            "Restrict results to nodes in these node_sets"
+            " (the node_set values used during add/remember)."
+        ),
+    )
+    top_k: int | None = Field(default=15)
+    only_context: bool = Field(
+        default=False,
+        description=(
+            "Return what the LLM would have received instead of its answer. For"
+            " completion search types the result is the user prompt (conversation"
+            " history, then question plus retrieval context through the retriever's"
+            " template, then the session guidance block); the system prompt (the"
+            " retriever's task template) is system_prompt_result with verbose=true. The session layer comes from"
+            " session_id (the default session when omitted). Retrieval-only types"
+            " return their context. No LLM call is made and nothing is written to the"
+            " session."
+        ),
+    )
+    session_id: str | None = Field(
+        default=None,
+        examples=[None],
+        description=(
+            "Session whose history and guidance feed the completion (or the"
+            " only_context prompt). Omit to use the default session."
+        ),
+    )
+    verbose: bool = Field(
+        default=False,
+        description=(
+            "Return detailed result information including the graph representation when available."
+        ),
+    )
+    skills: list[str] | None = Field(
+        default=None,
+        examples=[None],
+        description=(
+            "Skill names to load into the agentic retriever."
+            " Requires search_type=AGENTIC_COMPLETION; leave null otherwise."
+        ),
+    )
+    tools: list[str] | None = Field(
+        default=None,
+        examples=[None],
+        description=(
+            "Whitelist of tool names available to the agentic retriever."
+            " Requires search_type=AGENTIC_COMPLETION."
+        ),
+    )
+    max_iter: int | None = Field(
+        default=None,
+        examples=[None],
+        description=(
+            "Maximum agentic tool-call iterations before forcing a final answer"
+            " (positive integer; AGENTIC_COMPLETION only)."
+        ),
+    )
+    include_references: bool = Field(
+        default=False,
+        description="Attach source references to completion-type results.",
+    )
+    code_query: dict[str, Any] | None = Field(
+        default=None,
+        description=(
+            "Structured arguments for search_type=CODE. Set operation to query_facts, "
+            "explore, traverse, find_path, impact_analysis, insights, architecture, or "
+            "delta. Add diagram='mermaid' (or 'dot', or true) to receive the result "
+            "rendered as diagram source under search_result[0].diagram; architecture "
+            "includes a Mermaid diagram unless diagram=false."
+        ),
+    )
 
 
 def get_search_router() -> APIRouter:
@@ -42,8 +141,19 @@ def get_search_router() -> APIRouter:
         text: str
         user: str
         created_at: datetime
+        # Null when the search was not scoped to a single dataset.
+        dataset_id: UUID | None = None
 
-    @router.get("", response_model=list[SearchHistoryItem])
+    @router.get(
+        "",
+        summary="List the caller's recent search history",
+        response_model=list[SearchHistoryItem],
+        responses={
+            403: {"model": ErrorResponse},
+            422: {"model": ErrorResponse},
+            500: {"model": ErrorResponse},
+        },
+    )
     async def get_search_history(user: User = Depends(get_authenticated_user)):
         """
         Get search history for the authenticated user.
@@ -63,7 +173,7 @@ def get_search_router() -> APIRouter:
         """
         send_telemetry(
             "Search API Endpoint Invoked",
-            user.id,
+            user,
             additional_properties={"endpoint": "GET /v1/search", "cognee_version": cognee_version},
         )
 
@@ -71,10 +181,29 @@ def get_search_router() -> APIRouter:
             history = await get_history(user.id, limit=0)
 
             return history
+        except CogneeApiError:
+            raise
         except Exception as error:
-            return JSONResponse(status_code=500, content={"error": str(error)})
+            logger.exception("get_search_router.get_search_history failed, returning HTTP 500")
+            return JSONResponse(
+                status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+                content=ErrorResponse(
+                    error="Internal server error",
+                    detail=str(error),
+                ).model_dump(),
+            )
 
-    @router.post("", response_model=Union[List[SearchResult], List])
+    @router.post(
+        "",
+        summary="Search (low level): run one SearchType over the caller's datasets",
+        response_model=list[SearchResult] | list,
+        responses={
+            403: {"model": ErrorResponse},
+            422: {"model": ErrorResponse},
+            500: {"model": ErrorResponse},
+        },
+    )
+    @log_usage(function_name="POST /v1/search", log_type="api_endpoint")
     async def search(payload: SearchPayloadDTO, user: User = Depends(get_authenticated_user)):
         """
         Search for nodes in the graph database.
@@ -84,41 +213,58 @@ def get_search_router() -> APIRouter:
         types and can be scoped to specific datasets.
 
         ## Request Parameters
-        - **search_type** (SearchType): Type of search to perform
+        - **search_type** (SearchType): Type of search to perform (default: HYBRID_COMPLETION). Use AGENTIC_COMPLETION to enable skills, tools and max_iter.
         - **datasets** (Optional[List[str]]): List of dataset names to search within
         - **dataset_ids** (Optional[List[UUID]]): List of dataset UUIDs to search within
         - **query** (str): The search query string
         - **system_prompt** Optional[str]: System prompt to be used for Completion type searches in Cognee
         - **node_name** Optional[list[str]]: Filter results to specific node_sets defined in the add pipeline (for targeted search).
-        - **top_k** (Optional[int]): Maximum number of results to return (default: 10)
-        - **only_context** bool: Set to true to only return context Cognee will be sending to LLM in Completion type searches. This will be returned instead of LLM calls for completion type searches.
+        - **top_k** (Optional[int]): Maximum number of results to return (default: 15)
+        - **only_context** bool: Return what the LLM would have received instead of its answer. For completion type searches the result is the user prompt (conversation history, then question plus retrieval context through the retriever's template, then the session guidance block); the system prompt (the retriever's task template) is `system_prompt_result` with verbose=true. Retrieval-only types return their context. No LLM call is made.
+        - **session_id** (Optional[str]): Session whose history and guidance feed the completion or the only_context prompt; the default session when omitted.
+        - **verbose** (bool): Return detailed result information including the graph representation when available (default: false)
+        - **skills** (Optional[List[str]]): Skill names to load into the agentic retriever (AGENTIC_COMPLETION only)
+        - **tools** (Optional[List[str]]): Tool whitelist for AGENTIC_COMPLETION searches
+        - **max_iter** (Optional[int]): Max agentic iterations, must be >= 1 (AGENTIC_COMPLETION only)
+        - **include_references** (bool): Attach source references to completion-type results (default: true)
+        - **code_query** (Optional[dict]): Structured operation arguments for CODE search
 
         ## Response
         Returns a list of search results containing relevant nodes from the graph.
 
         ## Error Codes
-        - **409 Conflict**: Error during search operation
-        - **403 Forbidden**: User doesn't have permission to search datasets (returns empty list)
+        - **402/403/404/409/422**: Cognee errors (payment required, permission
+          denied, missing user, session-dataset conflict, prerequisites not met)
+          return their own status code and message via the global error handler
+        - **500 Internal Server Error**: Unexpected error during search
 
         ## Notes
         - Datasets sent by name will only map to datasets owned by the request sender
         - To search datasets not owned by the request sender, dataset UUID is needed
-        - If permission is denied, returns empty list instead of error
+        - If dataset_ids is provided, the datasets name list is ignored
         """
         send_telemetry(
             "Search API Endpoint Invoked",
-            user.id,
+            user,
             additional_properties={
                 "endpoint": "POST /v1/search",
                 "search_type": str(payload.search_type),
                 "datasets": payload.datasets,
                 "dataset_ids": [str(dataset_id) for dataset_id in payload.dataset_ids or []],
-                "query": payload.query,
-                "system_prompt": payload.system_prompt,
-                "node_name": payload.node_name,
+                # Request fields are recorded by size, matching the recall
+                # endpoint's convention (see recall.py telemetry).
+                "query": len(payload.query or ""),
+                "system_prompt": len(payload.system_prompt or ""),
+                "node_name": len(payload.node_name or []),
                 "top_k": payload.top_k,
                 "only_context": payload.only_context,
+                "session_id": payload.session_id,
                 "verbose": payload.verbose,
+                "skills": payload.skills,
+                "tools": payload.tools,
+                "max_iter": payload.max_iter,
+                "include_references": payload.include_references,
+                "code_query": len(str(payload.code_query)) if payload.code_query else 0,
                 "cognee_version": cognee_version,
             },
         )
@@ -130,30 +276,38 @@ def get_search_router() -> APIRouter:
                 query_text=payload.query,
                 query_type=payload.search_type,
                 user=user,
-                datasets=payload.datasets,
+                datasets=payload.datasets
+                if not payload.dataset_ids
+                else None,  # If dataset_ids are provided, ignore datasets by name to avoid confusion and potential mismatches.
                 dataset_ids=payload.dataset_ids,
                 system_prompt=payload.system_prompt,
                 node_name=payload.node_name,
                 top_k=payload.top_k,
                 verbose=payload.verbose,
                 only_context=payload.only_context,
+                session_id=payload.session_id,
+                skills=payload.skills,
+                tools=payload.tools,
+                max_iter=payload.max_iter,
+                include_references=payload.include_references,
+                code_query=payload.code_query,
             )
 
             return jsonable_encoder(results)
-        except (DatabaseNotCreatedError, UserNotFoundError, CogneeValidationError) as e:
-            # Return a clear 422 with actionable guidance instead of leaking a stacktrace
-            status_code = getattr(e, "status_code", 422)
-            return JSONResponse(
-                status_code=status_code,
-                content={
-                    "error": "Search prerequisites not met",
-                    "detail": str(e),
-                    "hint": "Run `await cognee.add(...)` then `await cognee.cognify()` before searching.",
-                },
-            )
-        except PermissionDeniedError:
-            return []
+        except CogneeApiError:
+            # Cognee errors (permission denied, payment required, prerequisites,
+            # session-dataset conflicts, ...) carry their own status code and
+            # actionable message; the global handler in cognee/api/client.py
+            # returns them to the caller.
+            raise
         except Exception as error:
-            return JSONResponse(status_code=409, content={"error": str(error)})
+            logger.exception("get_search_router.search failed, returning HTTP 500")
+            return JSONResponse(
+                status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+                content=ErrorResponse(
+                    error="Internal server error",
+                    detail=str(error),
+                ).model_dump(),
+            )
 
     return router

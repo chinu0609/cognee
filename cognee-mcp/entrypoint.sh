@@ -1,8 +1,10 @@
 #!/bin/bash
 
 set -e  # Exit on error
-echo "Debug mode: $DEBUG"
-echo "Environment: $ENVIRONMENT"
+# ENV is the canonical environment variable (matches what the app reads).
+# ENVIRONMENT is accepted as a deprecated fallback for older deployments.
+ENV="${ENV:-${ENVIRONMENT:-}}"
+echo "Environment: $ENV"
 
 # Install optional dependencies if EXTRAS is set
 if [ -n "$EXTRAS" ]; then
@@ -40,104 +42,108 @@ else
     echo "No optional dependencies specified"
 fi
 
+ARGS=("$@") #forward any args passed to the container at runtime
+
 # Set default transport mode if not specified
 TRANSPORT_MODE=${TRANSPORT_MODE:-"stdio"}
 echo "Transport mode: $TRANSPORT_MODE"
 
 # Set default ports if not specified
-DEBUG_PORT=${DEBUG_PORT:-5678}
-HTTP_PORT=${HTTP_PORT:-8000}
-echo "Debug port: $DEBUG_PORT"
-echo "HTTP port: $HTTP_PORT"
 
-# Check if API mode is enabled
-if [ -n "$API_URL" ]; then
-    echo "API mode enabled: $API_URL"
-    echo "Skipping database migrations (API server handles its own database)"
-else
-    echo "Direct mode: Using local cognee instance"
-    # Run Alembic migrations with proper error handling.
-    # Note on UserAlreadyExists error handling:
-    # During database migrations, we attempt to create a default user. If this user
-    # already exists (e.g., from a previous deployment or migration), it's not a
-    # critical error and shouldn't prevent the application from starting. This is
-    # different from other migration errors which could indicate database schema
-    # inconsistencies and should cause the startup to fail. This check allows for
-    # smooth redeployments and container restarts while maintaining data integrity.
-    echo "Running database migrations..."
-
-    MIGRATION_OUTPUT=$(alembic upgrade head)
-    MIGRATION_EXIT_CODE=$?
-
-    if [[ $MIGRATION_EXIT_CODE -ne 0 ]]; then
-        if [[ "$MIGRATION_OUTPUT" == *"UserAlreadyExists"* ]] || [[ "$MIGRATION_OUTPUT" == *"User default_user@example.com already exists"* ]]; then
-            echo "Warning: Default user already exists, continuing startup..."
-        else
-            echo "Migration failed with unexpected error."
-            exit 1
-        fi
-    fi
-
-    echo "Database migrations done."
+if [ "$TRANSPORT_MODE" != "stdio" ]; then
+    HTTP_PORT=${HTTP_PORT:-8000}
+    echo "HTTP port: $HTTP_PORT"
+    ARGS+=("--host" "0.0.0.0" "--port" "$HTTP_PORT")
 fi
 
 echo "Starting Cognee MCP Server with transport mode: $TRANSPORT_MODE"
+ARGS+=("--transport" "$TRANSPORT_MODE")
 
 # Add startup delay to ensure DB is ready
 sleep 2
 
 # Build API arguments if API_URL is set
-API_ARGS=""
 if [ -n "$API_URL" ]; then
+    echo "API mode enabled: $API_URL"
+
     # Handle localhost in API_URL - convert to host-accessible address
-    if echo "$API_URL" | grep -q "localhost" || echo "$API_URL" | grep -q "127.0.0.1"; then
+    if [[ "$API_URL" =~ "localhost" || "$API_URL" =~ "127.0.0.1" ]]; then
         echo "⚠️  Warning: API_URL contains localhost/127.0.0.1"
         echo "   Original: $API_URL"
 
-        # Try to use host.docker.internal (works on Mac/Windows and recent Linux with Docker Desktop)
-        FIXED_API_URL=$(echo "$API_URL" | sed 's/localhost/host.docker.internal/g' | sed 's/127\.0\.0\.1/host.docker.internal/g')
+        # Resolve the best hostname to reach the host from inside the container.
+        # Supports Docker Desktop, Colima / Lima, and plain Linux Docker.
+        HOST_ADDR=""
 
+        # 1. Docker Desktop (macOS, Windows, recent Linux Desktop)
+        if getent hosts host.docker.internal >/dev/null 2>&1; then
+            HOST_ADDR="host.docker.internal"
+            echo "   ✓ Resolved via host.docker.internal (Docker Desktop)"
+
+        # 2. Colima / Lima on macOS / Linux
+        elif getent hosts host.lima.internal >/dev/null 2>&1; then
+            HOST_ADDR="host.lima.internal"
+            echo "   ✓ Resolved via host.lima.internal (Colima / Lima)"
+
+        # 3. Fallback: default gateway IP (works on plain Linux Docker).
+        # Read it from /proc/net/route, which exists in every Linux container with
+        # no extra package. (The runtime image is debian-slim and does NOT ship the
+        # `ip` binary / iproute2, so `ip route` would fail and leave this empty.)
+        # awk only extracts the little-endian hex gateway of the default route
+        # (destination 00000000) — no gawk-only strtonum, so it works under mawk too.
+        else
+            GATEWAY_HEX=$(awk '$2 == "00000000" { print $3; exit }' /proc/net/route 2>/dev/null || true)
+            GATEWAY_IP=""
+            if [ -n "$GATEWAY_HEX" ]; then
+                # /proc/net/route stores the gateway little-endian, so reverse the
+                # byte pairs to get dotted-decimal (e.g. 010011AC -> 172.17.0.1).
+                GATEWAY_IP=$(printf "%d.%d.%d.%d" \
+                    "0x${GATEWAY_HEX:6:2}" "0x${GATEWAY_HEX:4:2}" \
+                    "0x${GATEWAY_HEX:2:2}" "0x${GATEWAY_HEX:0:2}" 2>/dev/null || true)
+            fi
+            if [ -n "$GATEWAY_IP" ]; then
+                HOST_ADDR="$GATEWAY_IP"
+                echo "   ✓ Resolved via default gateway IP: $GATEWAY_IP"
+            else
+                # Last resort: keep host.docker.internal and let the user know
+                HOST_ADDR="host.docker.internal"
+                echo "   ⚠️  Could not auto-detect host address; defaulting to host.docker.internal"
+                echo "   If this fails, try one of:"
+                echo "     - Colima: colima start --network-address"
+                echo "     - Linux:  use --network host, or set API_URL=http://172.17.0.1:<port>"
+            fi
+        fi
+
+        FIXED_API_URL=$(echo "$API_URL" | sed "s/localhost/$HOST_ADDR/g" | sed "s/127\.0\.0\.1/$HOST_ADDR/g")
         echo "   Converted to: $FIXED_API_URL"
-        echo "   This will work on Mac/Windows/Docker Desktop."
-        echo "   On Linux without Docker Desktop, you may need to:"
-        echo "     - Use --network host, OR"
-        echo "     - Set API_URL=http://172.17.0.1:8000 (Docker bridge IP)"
 
         API_URL="$FIXED_API_URL"
     fi
 
-    API_ARGS="--api-url $API_URL"
+    ARGS+=("--api-url" "$API_URL")
     if [ -n "$API_TOKEN" ]; then
-        API_ARGS="$API_ARGS --api-token $API_TOKEN"
-    fi
-fi
-
-# Modified startup with transport mode selection and error handling
-if [ "$ENVIRONMENT" = "dev" ] || [ "$ENVIRONMENT" = "local" ]; then
-    if [ "$DEBUG" = "true" ]; then
-        echo "Waiting for the debugger to attach..."
-        if [ "$TRANSPORT_MODE" = "sse" ]; then
-            exec python -m debugpy --wait-for-client --listen 0.0.0.0:$DEBUG_PORT -m cognee-mcp --transport sse --host 0.0.0.0 --port $HTTP_PORT --no-migration $API_ARGS
-        elif [ "$TRANSPORT_MODE" = "http" ]; then
-            exec python -m debugpy --wait-for-client --listen 0.0.0.0:$DEBUG_PORT -m cognee-mcp --transport http --host 0.0.0.0 --port $HTTP_PORT --no-migration $API_ARGS
-        else
-            exec python -m debugpy --wait-for-client --listen 0.0.0.0:$DEBUG_PORT -m cognee-mcp --transport stdio --no-migration $API_ARGS
-        fi
-    else
-        if [ "$TRANSPORT_MODE" = "sse" ]; then
-            exec cognee-mcp --transport sse --host 0.0.0.0 --port $HTTP_PORT --no-migration $API_ARGS
-        elif [ "$TRANSPORT_MODE" = "http" ]; then
-            exec cognee-mcp --transport http --host 0.0.0.0 --port $HTTP_PORT --no-migration $API_ARGS
-        else
-            exec cognee-mcp --transport stdio --no-migration $API_ARGS
-        fi
+        ARGS+=("--api-token" "$API_TOKEN")
     fi
 else
-    if [ "$TRANSPORT_MODE" = "sse" ]; then
-        exec cognee-mcp --transport sse --host 0.0.0.0 --port $HTTP_PORT --no-migration $API_ARGS
-    elif [ "$TRANSPORT_MODE" = "http" ]; then
-        exec cognee-mcp --transport http --host 0.0.0.0 --port $HTTP_PORT --no-migration $API_ARGS
-    else
-        exec cognee-mcp --transport stdio --no-migration $API_ARGS
+    echo "Direct mode: Using local cognee instance"
+fi
+
+# Echo the launch command with the API token redacted: the container log is
+# readable by anyone with docker access, and the token is a long-lived credential.
+LOG_ARGS=("${ARGS[@]}")
+for i in "${!LOG_ARGS[@]}"; do
+    if [ "${LOG_ARGS[$i]}" = "--api-token" ] && [ $((i + 1)) -lt ${#LOG_ARGS[@]} ]; then
+        LOG_ARGS[$((i + 1))]="<redacted>"
     fi
+done
+echo "calling cognee-mcp" "${LOG_ARGS[@]}"
+
+if [ "$DEBUG" = "true" ] && { [ "$ENV" = "dev" ] || [ "$ENV" = "local" ]; }; then
+    DEBUG_PORT=${DEBUG_PORT:-5678}
+    echo "Running in debug mode"
+    echo "Debug port: $DEBUG_PORT"
+    echo "Waiting for the debugger to attach..."
+    exec python -m debugpy --wait-for-client --listen 0.0.0.0:"$DEBUG_PORT" "$(command -v cognee-mcp)" "${ARGS[@]}"
+else
+    exec cognee-mcp "${ARGS[@]}"
 fi

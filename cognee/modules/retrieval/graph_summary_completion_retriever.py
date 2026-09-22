@@ -1,5 +1,4 @@
-from typing import Optional, Type, List
-
+from cognee.base_config import get_base_config
 from cognee.modules.retrieval.graph_completion_retriever import GraphCompletionRetriever
 from cognee.modules.retrieval.utils.completion import summarize_text
 
@@ -21,13 +20,16 @@ class GraphSummaryCompletionRetriever(GraphCompletionRetriever):
         user_prompt_path: str = "graph_context_for_question.txt",
         system_prompt_path: str = "answer_simple_question.txt",
         summarize_prompt_path: str = "summarize_search_results.txt",
-        system_prompt: Optional[str] = None,
-        top_k: Optional[int] = 5,
-        node_type: Optional[Type] = None,
-        node_name: Optional[List[str]] = None,
-        save_interaction: bool = False,
-        wide_search_top_k: Optional[int] = 100,
-        triplet_distance_penalty: Optional[float] = 3.5,
+        system_prompt: str | None = None,
+        top_k: int | None = 5,
+        node_type: type | None = None,
+        node_name: list[str] | None = None,
+        node_name_filter_operator: str = "OR",
+        wide_search_top_k: int | None = 100,
+        triplet_distance_penalty: float | None = 6.5,
+        feedback_influence: float = get_base_config().default_feedback_influence,
+        session_id: str | None = None,
+        include_references: bool = False,
     ):
         """Initialize retriever with default prompt paths and search parameters."""
         super().__init__(
@@ -36,10 +38,13 @@ class GraphSummaryCompletionRetriever(GraphCompletionRetriever):
             top_k=top_k,
             node_type=node_type,
             node_name=node_name,
-            save_interaction=save_interaction,
+            node_name_filter_operator=node_name_filter_operator,
             system_prompt=system_prompt,
             wide_search_top_k=wide_search_top_k,
             triplet_distance_penalty=triplet_distance_penalty,
+            feedback_influence=feedback_influence,
+            session_id=session_id,
+            include_references=include_references,
         )
         self.summarize_prompt_path = summarize_prompt_path
 

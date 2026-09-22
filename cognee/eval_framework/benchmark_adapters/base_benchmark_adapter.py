@@ -1,19 +1,23 @@
-from abc import ABC, abstractmethod
-from typing import List, Optional, Any, Union, Tuple
-import os
 import json
+import os
+from abc import ABC, abstractmethod
+from typing import Any
+
 from cognee.shared.logging_utils import get_logger
 
 logger = get_logger()
 
 
 class BaseBenchmarkAdapter(ABC):
+    async def prepare_corpus(self) -> None:
+        return None
+
     def _filter_instances(
         self,
-        instances: List[dict[str, Any]],
-        instance_filter: Union[str, List[str], List[int]],
+        instances: list[dict[str, Any]],
+        instance_filter: str | list[str] | list[int],
         id_key: str = "id",
-    ) -> List[dict[str, Any]]:
+    ) -> list[dict[str, Any]]:
         """Filter instances by IDs or indices, or load filter from a JSON file."""
         if isinstance(instance_filter, str):
             logger.info(f"Loading instance filter from file: {instance_filter}")
@@ -47,9 +51,9 @@ class BaseBenchmarkAdapter(ABC):
     @abstractmethod
     def load_corpus(
         self,
-        limit: Optional[int] = None,
+        limit: int | None = None,
         seed: int = 42,
         load_golden_context: bool = False,
-        instance_filter: Optional[Union[str, List[str], List[int]]] = None,
-    ) -> Tuple[List[str], List[dict[str, Any]]]:
+        instance_filter: str | list[str] | list[int] | None = None,
+    ) -> tuple[list[str], list[dict[str, Any]]]:
         pass

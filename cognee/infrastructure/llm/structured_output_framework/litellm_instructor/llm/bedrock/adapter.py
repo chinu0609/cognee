@@ -1,27 +1,38 @@
-import litellm
-import instructor
-from typing import Type
-from pydantic import BaseModel
-from litellm.exceptions import ContentPolicyViolationError
-from instructor.exceptions import InstructorRetryException
+import logging
+from typing import Any
 
-from cognee.infrastructure.llm.LLMGateway import LLMGateway
-from cognee.infrastructure.llm.structured_output_framework.litellm_instructor.llm.llm_interface import (
-    LLMInterface,
-)
+import instructor
+import litellm
+from instructor.exceptions import InstructorRetryException
+from litellm.exceptions import ContentPolicyViolationError
+from pydantic import BaseModel
+from tenacity import before_sleep_log, retry, wait_exponential_jitter
+
+from cognee.infrastructure.files.storage.s3_config import get_s3_config
 from cognee.infrastructure.llm.exceptions import (
     ContentPolicyFilterError,
     MissingSystemPromptPathError,
+    raise_if_budget_exhausted,
 )
-from cognee.infrastructure.files.storage.s3_config import get_s3_config
-from cognee.infrastructure.llm.structured_output_framework.litellm_instructor.llm.rate_limiter import (
-    rate_limit_async,
-    rate_limit_sync,
-    sleep_and_retry_async,
-    sleep_and_retry_sync,
+from cognee.infrastructure.llm.prompts.read_query_prompt import read_query_prompt
+from cognee.infrastructure.llm.retry_config import (
+    llm_retry_condition,
+    llm_retry_stop_condition,
+)
+from cognee.infrastructure.llm.structured_output_framework.litellm_instructor.llm.instructor_modes import (
+    get_instructor_mode,
+)
+from cognee.infrastructure.llm.structured_output_framework.litellm_instructor.llm.llm_interface import (
+    LLMInterface,
+)
+from cognee.infrastructure.llm.structured_output_framework.litellm_instructor.llm.types import (
+    TranscriptionReturnType,
 )
 from cognee.modules.observability.get_observe import get_observe
+from cognee.shared.logging_utils import get_logger
+from cognee.shared.rate_limiting import llm_rate_limiter_context_manager
 
+logger = get_logger()
 observe = get_observe()
 
 
@@ -34,20 +45,19 @@ class BedrockAdapter(LLMInterface):
     """
 
     name = "Bedrock"
-    model: str
-    api_key: str
-    default_instructor_mode = "json_schema_mode"
+    default_instructor_mode = get_instructor_mode("bedrock")
 
-    MAX_RETRIES = 5
+    MAX_RETRIES = 2
 
     def __init__(
         self,
         model: str,
-        api_key: str = None,
+        api_key: str | None = None,
         max_completion_tokens: int = 16384,
         streaming: bool = False,
-        instructor_mode: str = None,
-    ):
+        instructor_mode: str | None = None,
+        llm_args: dict[str, Any] | None = None,
+    ) -> None:
         self.instructor_mode = instructor_mode if instructor_mode else self.default_instructor_mode
 
         self.aclient = instructor.from_litellm(
@@ -58,24 +68,26 @@ class BedrockAdapter(LLMInterface):
         self.api_key = api_key
         self.max_completion_tokens = max_completion_tokens
         self.streaming = streaming
+        self.llm_args: dict[str, Any] = llm_args or {}
 
     def _create_bedrock_request(
-        self, text_input: str, system_prompt: str, response_model: Type[BaseModel]
-    ) -> dict:
+        self, text_input: str, system_prompt: str, response_model: type[BaseModel], **kwargs: Any
+    ) -> dict[str, Any]:
         """Create Bedrock request with authentication."""
 
+        merged_kwargs = {**self.llm_args, **kwargs}
         request_params = {
             "model": self.model,
             "custom_llm_provider": "bedrock",
             "drop_params": True,
             "messages": [
-                {"role": "user", "content": text_input},
                 {"role": "system", "content": system_prompt},
+                {"role": "user", "content": text_input},
             ],
             "response_model": response_model,
             "max_retries": self.MAX_RETRIES,
-            "max_completion_tokens": self.max_completion_tokens,
             "stream": self.streaming,
+            **merged_kwargs,
         }
 
         s3_config = get_s3_config()
@@ -101,49 +113,71 @@ class BedrockAdapter(LLMInterface):
         return request_params
 
     @observe(as_type="generation")
-    @sleep_and_retry_async()
-    @rate_limit_async
+    @retry(
+        stop=llm_retry_stop_condition,
+        wait=wait_exponential_jitter(8, 128),
+        retry=llm_retry_condition,
+        before_sleep=before_sleep_log(logger, logging.WARNING),
+        reraise=True,
+    )
     async def acreate_structured_output(
-        self, text_input: str, system_prompt: str, response_model: Type[BaseModel]
+        self, text_input: str, system_prompt: str, response_model: type[BaseModel], **kwargs: Any
     ) -> BaseModel:
         """Generate structured output from AWS Bedrock API."""
 
         try:
-            request_params = self._create_bedrock_request(text_input, system_prompt, response_model)
-            return await self.aclient.chat.completions.create(**request_params)
+            request_params = self._create_bedrock_request(
+                text_input, system_prompt, response_model, **kwargs
+            )
+            # Dispatch through the pacing seam so overload errors reach the
+            # OverloadPolicy and paced episodes throttle this adapter too.
+            async with llm_rate_limiter_context_manager():
+                return await self.aclient.chat.completions.create(**request_params)
 
         except (
             ContentPolicyViolationError,
             InstructorRetryException,
         ) as error:
+            # Classified here because the handler further down is unreachable once
+            # this clause matches, and ahead of the content-policy check because
+            # the model's partial completion is rendered into str(error): a budget
+            # rejection whose completion mentions a content policy would otherwise
+            # be misclassified. No fallback path exists here, unlike openai/azure.
+            raise_if_budget_exhausted(error)
+
             if (
                 isinstance(error, InstructorRetryException)
                 and "content management policy" not in str(error).lower()
             ):
-                raise error
+                raise
 
             raise ContentPolicyFilterError(
                 f"The provided input contains content that is not aligned with our content policy: {text_input}"
             )
+        except Exception as e:
+            # Same detail-carrying message as the wrapped-error path above.
+            raise_if_budget_exhausted(e)
+            raise
 
-    @observe
-    @sleep_and_retry_sync()
-    @rate_limit_sync
-    def create_structured_output(
-        self, text_input: str, system_prompt: str, response_model: Type[BaseModel]
-    ) -> BaseModel:
-        """Generate structured output from AWS Bedrock API (synchronous)."""
+    async def create_transcript(self, input: str, **kwargs: Any) -> TranscriptionReturnType | None:
+        raise NotImplementedError
 
-        request_params = self._create_bedrock_request(text_input, system_prompt, response_model)
-        return self.client.chat.completions.create(**request_params)
+    async def transcribe_image(
+        self,
+        input: str,
+        prompt: str | None = None,
+        max_completion_tokens: int | None = None,
+        reasoning_effort: str | None = None,
+    ) -> Any:
+        raise NotImplementedError
 
-    def show_prompt(self, text_input: str, system_prompt: str) -> str:
+    def show_prompt(self, text_input: str, system_prompt: str) -> str | None:
         """Format and display the prompt for a user query."""
         if not text_input:
             text_input = "No user input provided."
         if not system_prompt:
             raise MissingSystemPromptPathError()
-        system_prompt = LLMGateway.read_query_prompt(system_prompt)
+        system_prompt: str | None = read_query_prompt(system_prompt)
 
         formatted_prompt = (
             f"""System Prompt:\n{system_prompt}\n\nUser Input:\n{text_input}\n"""

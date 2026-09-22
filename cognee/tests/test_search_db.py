@@ -1,33 +1,36 @@
-import pathlib
-import os
 import asyncio
+import logging
+import os
+import pathlib
+from collections import Counter
+
 import pytest
 import pytest_asyncio
-from collections import Counter
 
 import cognee
 from cognee.infrastructure.databases.graph import get_graph_engine
-from cognee.infrastructure.databases.vector import get_vector_engine
+from cognee.infrastructure.databases.vector import get_vector_engine_async
 from cognee.modules.graph.cognee_graph.CogneeGraphElements import Edge
-from cognee.modules.graph.utils import resolve_edges_to_text
-from cognee.modules.retrieval.graph_completion_retriever import GraphCompletionRetriever
+from cognee.modules.retrieval.chunks_retriever import ChunksRetriever
+from cognee.modules.retrieval.completion_retriever import CompletionRetriever
 from cognee.modules.retrieval.graph_completion_context_extension_retriever import (
     GraphCompletionContextExtensionRetriever,
 )
 from cognee.modules.retrieval.graph_completion_cot_retriever import GraphCompletionCotRetriever
+from cognee.modules.retrieval.graph_completion_decomposition_retriever import (
+    GraphCompletionDecompositionRetriever,
+)
+from cognee.modules.retrieval.graph_completion_retriever import GraphCompletionRetriever
 from cognee.modules.retrieval.graph_summary_completion_retriever import (
     GraphSummaryCompletionRetriever,
 )
-from cognee.modules.retrieval.chunks_retriever import ChunksRetriever
 from cognee.modules.retrieval.summaries_retriever import SummariesRetriever
-from cognee.modules.retrieval.completion_retriever import CompletionRetriever
 from cognee.modules.retrieval.temporal_retriever import TemporalRetriever
 from cognee.modules.retrieval.triplet_retriever import TripletRetriever
-from cognee.shared.logging_utils import get_logger
 from cognee.modules.search.types import SearchType
 from cognee.modules.users.methods import get_default_user
 
-logger = get_logger()
+logger = logging.getLogger(__name__)
 
 
 async def _reset_engines_and_prune() -> None:
@@ -38,21 +41,21 @@ async def _reset_engines_and_prune() -> None:
     """
     # Dispose of existing engines and clear caches to ensure fresh instances for each test
     try:
-        from cognee.infrastructure.databases.vector import get_vector_engine
+        from cognee.infrastructure.databases.vector import get_vector_engine_async
 
-        vector_engine = get_vector_engine()
+        vector_engine = await get_vector_engine_async()
         # Dispose SQLAlchemy engine connection pool if it exists
         if hasattr(vector_engine, "engine") and hasattr(vector_engine.engine, "dispose"):
             await vector_engine.engine.dispose(close=True)
     except Exception:
         # Engine might not exist yet
-        pass
+        logger.debug("Ignoring exception in _reset_engines_and_prune", exc_info=True)
 
     from cognee.infrastructure.databases.graph.get_graph_engine import _create_graph_engine
-    from cognee.infrastructure.databases.vector.create_vector_engine import _create_vector_engine
     from cognee.infrastructure.databases.relational.create_relational_engine import (
         create_relational_engine,
     )
+    from cognee.infrastructure.databases.vector.create_vector_engine import _create_vector_engine
 
     _create_graph_engine.cache_clear()
     _create_vector_engine.cache_clear()
@@ -100,6 +103,27 @@ def event_loop():
         loop.close()
 
 
+@pytest.fixture(scope="session", autouse=True)
+def _disable_session_turn_gating():
+    """Disable session-turn gating (auto_feedback) so retrieval answers directly.
+
+    These tests exercise pure retrieval. The session-turn analysis runs on every non-only_context
+    search when caching + auto_feedback are enabled (both default True) and can intercept
+    multi-turn queries with a clarifying acknowledgement instead of an answer, making the
+    retrieval assertions non-deterministic. That layer has its own dedicated tests
+    (e.g. test_session_context_turn_flow.py), so it is turned off here.
+    """
+    prev = os.environ.get("AUTO_FEEDBACK")
+    os.environ["AUTO_FEEDBACK"] = "False"
+    try:
+        yield
+    finally:
+        if prev is None:
+            os.environ.pop("AUTO_FEEDBACK", None)
+        else:
+            os.environ["AUTO_FEEDBACK"] = prev
+
+
 async def setup_test_environment():
     """Helper function to set up test environment with data, cognify, and triplet embeddings."""
     # This test runs for multiple db settings, to run this locally set the corresponding db envs
@@ -116,7 +140,7 @@ async def setup_test_environment():
     await create_triplet_embeddings(user=user, dataset=dataset_name, triplets_batch_size=5)
 
     # Check if Triplet_text collection was created
-    vector_engine = get_vector_engine()
+    vector_engine = await get_vector_engine_async()
     has_collection = await vector_engine.has_collection(collection_name="Triplet_text")
     logger.info(f"Triplet_text collection exists after creation: {has_collection}")
 
@@ -128,15 +152,16 @@ async def setup_test_environment():
     return state
 
 
-async def setup_test_environment_for_feedback():
-    """Helper function to set up test environment for feedback weight calculation test."""
-    dataset_name = "test_dataset"
-    await _reset_engines_and_prune()
-    return await _seed_default_dataset(dataset_name=dataset_name)
+async def _get_retriever_context(retriever, query: str):
+    """Retrieve objects and resolve context via the retriever API."""
+    retrieved_objects = await retriever.get_retrieved_objects(query)
+    return await retriever.get_context_from_objects(
+        query=query, retrieved_objects=retrieved_objects
+    )
 
 
 @pytest_asyncio.fixture(scope="session")
-async def e2e_state():
+async def e2e_state(_disable_session_turn_gating):
     """Compute E2E artifacts once; tests only assert.
 
     This avoids repeating expensive setup and LLM calls across multiple tests.
@@ -147,7 +172,7 @@ async def e2e_state():
     graph_engine = await get_graph_engine()
     _nodes, edges = await graph_engine.get_graph_data()
 
-    vector_engine = get_vector_engine()
+    vector_engine = await get_vector_engine_async()
     collection = await vector_engine.search(
         collection_name="Triplet_text",
         query_text="Test",
@@ -158,19 +183,28 @@ async def e2e_state():
     query = "Next to which country is Germany located?"
 
     contexts = {
-        "graph_completion": await GraphCompletionRetriever().get_context(query=query),
-        "graph_completion_cot": await GraphCompletionCotRetriever().get_context(query=query),
-        "graph_completion_context_extension": await GraphCompletionContextExtensionRetriever().get_context(
-            query=query
+        "graph_completion": await _get_retriever_context(GraphCompletionRetriever(), query=query),
+        "graph_completion_decomposition_answer_per_subquery": await _get_retriever_context(
+            GraphCompletionDecompositionRetriever(), query=query
         ),
-        "graph_summary_completion": await GraphSummaryCompletionRetriever().get_context(
-            query=query
+        "graph_completion_decomposition_combined_triplets": await _get_retriever_context(
+            GraphCompletionDecompositionRetriever(decomposition_mode="combined_triplets_context"),
+            query=query,
         ),
-        "chunks": await ChunksRetriever(top_k=5).get_context(query=query),
-        "summaries": await SummariesRetriever(top_k=5).get_context(query=query),
-        "rag_completion": await CompletionRetriever(top_k=3).get_context(query=query),
-        "temporal": await TemporalRetriever(top_k=5).get_context(query=query),
-        "triplet": await TripletRetriever().get_context(query=query),
+        "graph_completion_cot": await _get_retriever_context(
+            GraphCompletionCotRetriever(), query=query
+        ),
+        "graph_completion_context_extension": await _get_retriever_context(
+            GraphCompletionContextExtensionRetriever(), query=query
+        ),
+        "graph_summary_completion": await _get_retriever_context(
+            GraphSummaryCompletionRetriever(), query=query
+        ),
+        "chunks": await _get_retriever_context(ChunksRetriever(top_k=5), query=query),
+        "summaries": await _get_retriever_context(SummariesRetriever(top_k=5), query=query),
+        "rag_completion": await _get_retriever_context(CompletionRetriever(top_k=3), query=query),
+        "temporal": await _get_retriever_context(TemporalRetriever(top_k=5), query=query),
+        "triplet": await _get_retriever_context(TripletRetriever(), query=query),
     }
 
     # --- Retriever triplets + vector distance validation ---
@@ -189,70 +223,58 @@ async def e2e_state():
     completion_gk = await cognee.search(
         query_type=SearchType.GRAPH_COMPLETION,
         query_text="Where is germany located, next to which country?",
-        save_interaction=True,
         verbose=True,
+    )
+    completion_decomposition_answer_per_subquery = await cognee.search(
+        query_type=SearchType.GRAPH_COMPLETION_DECOMPOSITION,
+        query_text="Where is germany located, next to which country?",
+        verbose=True,
+    )
+    completion_decomposition_combined_triplets = await cognee.search(
+        query_type=SearchType.GRAPH_COMPLETION_DECOMPOSITION,
+        query_text="Where is germany located, next to which country?",
+        verbose=True,
+        retriever_specific_config={"decomposition_mode": "combined_triplets_context"},
     )
     completion_cot = await cognee.search(
         query_type=SearchType.GRAPH_COMPLETION_COT,
         query_text="What is the country next to germany??",
-        save_interaction=True,
         verbose=True,
     )
     completion_ext = await cognee.search(
         query_type=SearchType.GRAPH_COMPLETION_CONTEXT_EXTENSION,
         query_text="What is the name of the country next to germany",
-        save_interaction=True,
-        verbose=True,
-    )
-
-    await cognee.search(
-        query_type=SearchType.FEEDBACK,
-        query_text="This was not the best answer",
-        last_k=1,
         verbose=True,
     )
 
     completion_sum = await cognee.search(
         query_type=SearchType.GRAPH_SUMMARY_COMPLETION,
         query_text="Next to which country is Germany located?",
-        save_interaction=True,
         verbose=True,
     )
     completion_triplet = await cognee.search(
         query_type=SearchType.TRIPLET_COMPLETION,
         query_text="Next to which country is Germany located?",
-        save_interaction=True,
         verbose=True,
     )
     completion_chunks = await cognee.search(
         query_type=SearchType.CHUNKS,
         query_text="Germany",
-        save_interaction=False,
         verbose=True,
     )
     completion_summaries = await cognee.search(
         query_type=SearchType.SUMMARIES,
         query_text="Germany",
-        save_interaction=False,
         verbose=True,
     )
     completion_rag = await cognee.search(
         query_type=SearchType.RAG_COMPLETION,
         query_text="Next to which country is Germany located?",
-        save_interaction=False,
         verbose=True,
     )
     completion_temporal = await cognee.search(
         query_type=SearchType.TEMPORAL,
         query_text="Next to which country is Germany located?",
-        save_interaction=False,
-        verbose=True,
-    )
-
-    await cognee.search(
-        query_type=SearchType.FEEDBACK,
-        query_text="This answer was great",
-        last_k=1,
         verbose=True,
     )
 
@@ -268,6 +290,12 @@ async def e2e_state():
         "triplets": triplets,
         "search_results": {
             "graph_completion": completion_gk,
+            "graph_completion_decomposition_answer_per_subquery": (
+                completion_decomposition_answer_per_subquery
+            ),
+            "graph_completion_decomposition_combined_triplets": (
+                completion_decomposition_combined_triplets
+            ),
             "graph_completion_cot": completion_cot,
             "graph_completion_context_extension": completion_ext,
             "graph_summary_completion": completion_sum,
@@ -279,32 +307,6 @@ async def e2e_state():
         },
         "graph_snapshot": graph_snapshot,
     }
-
-
-@pytest_asyncio.fixture(scope="session")
-async def feedback_state():
-    """Feedback-weight scenario computed once (fresh environment)."""
-    await setup_test_environment_for_feedback()
-
-    await cognee.search(
-        query_type=SearchType.GRAPH_COMPLETION,
-        query_text="Next to which country is Germany located?",
-        save_interaction=True,
-    )
-    await cognee.search(
-        query_type=SearchType.FEEDBACK,
-        query_text="This was the best answer I've ever seen",
-        last_k=1,
-    )
-    await cognee.search(
-        query_type=SearchType.FEEDBACK,
-        query_text="Wow the correctness of this answer blows my mind",
-        last_k=1,
-    )
-
-    graph_engine = await get_graph_engine()
-    graph = await graph_engine.get_graph_data()
-    return {"graph_snapshot": graph}
 
 
 @pytest.mark.asyncio
@@ -320,33 +322,31 @@ async def test_e2e_retriever_contexts(e2e_state):
 
     for name in [
         "graph_completion",
+        "graph_completion_decomposition_answer_per_subquery",
+        "graph_completion_decomposition_combined_triplets",
         "graph_completion_cot",
         "graph_completion_context_extension",
         "graph_summary_completion",
     ]:
         ctx = contexts[name]
-        assert isinstance(ctx, list), f"{name}: Context should be a list"
-        assert ctx, f"{name}: Context should not be empty"
-        ctx_text = await resolve_edges_to_text(ctx)
-        lower = ctx_text.lower()
-        assert "germany" in lower or "netherlands" in lower, (
-            f"{name}: Context did not contain 'germany' or 'netherlands'; got: {ctx!r}"
-        )
+        assert isinstance(ctx, str), f"{name}: Context should be a string"
+        assert ctx.strip(), f"{name}: Context should not be empty"
+        lower = ctx.lower()
+        assert "germany" in lower or "netherlands" in lower
 
     triplet_ctx = contexts["triplet"]
     assert isinstance(triplet_ctx, str), "triplet: Context should be a string"
     assert triplet_ctx.strip(), "triplet: Context should not be empty"
 
     chunks_ctx = contexts["chunks"]
-    assert isinstance(chunks_ctx, list), "chunks: Context should be a list"
-    assert chunks_ctx, "chunks: Context should not be empty"
-    chunks_text = "\n".join(str(item.get("text", "")) for item in chunks_ctx).lower()
+    assert isinstance(chunks_ctx, str), "chunks: Context should be a string"
+    assert chunks_ctx.strip(), "chunks: Context should not be empty"
+    chunks_text = chunks_ctx.lower()
     assert "germany" in chunks_text or "netherlands" in chunks_text
 
     summaries_ctx = contexts["summaries"]
-    assert isinstance(summaries_ctx, list), "summaries: Context should be a list"
-    assert summaries_ctx, "summaries: Context should not be empty"
-    assert any(str(item.get("text", "")).strip() for item in summaries_ctx)
+    assert isinstance(summaries_ctx, str), "summaries: Context should be a string"
+    assert summaries_ctx.strip(), "summaries: Context should not be empty"
 
     rag_ctx = contexts["rag_completion"]
     assert isinstance(rag_ctx, str), "rag_completion: Context should be a string"
@@ -414,6 +414,8 @@ async def test_e2e_search_results_and_wrappers(e2e_state):
     # Completion-like search types: validate wrapper + content
     for name in [
         "graph_completion",
+        "graph_completion_decomposition_answer_per_subquery",
+        "graph_completion_decomposition_combined_triplets",
         "graph_completion_cot",
         "graph_completion_context_extension",
         "graph_summary_completion",
@@ -432,13 +434,15 @@ async def test_e2e_search_results_and_wrappers(e2e_state):
             )
             assert wrapper.get("dataset_id"), f"{name}: missing dataset_id in wrapper"
             assert wrapper.get("dataset_name") == "test_dataset"
-            assert "graphs" in wrapper
-            text = wrapper["search_result"][0]
+            result_payload = wrapper.get("text_result")
         else:
-            text = search_results[0]
+            entry = search_results[0]
+            assert isinstance(entry, dict), f"{name}: expected dict entries"
+            result_payload = entry.get("text_result")
 
-        assert isinstance(text, str) and text.strip()
-        assert "netherlands" in text.lower()
+        text_blob = str(result_payload)
+        assert text_blob.strip()
+        assert "netherlands" in text_blob.lower()
 
     # Non-LLM search types: CHUNKS / SUMMARIES validate payload list + text
     for name in ["chunks", "summaries"]:
@@ -446,57 +450,30 @@ async def test_e2e_search_results_and_wrappers(e2e_state):
         assert isinstance(search_results, list), f"{name}: should return a list"
         assert search_results, f"{name}: should not be empty"
 
-        first = search_results[0]
-        assert isinstance(first, dict), f"{name}: expected dict entries"
+        entry = search_results[0]
+        assert isinstance(entry, dict), f"{name}: expected dict entries"
 
-        payloads = search_results
-        if "search_result" in first and "text" not in first:
-            payloads = (first.get("search_result") or [None])[0]
+        context_result = entry.get("context_result")
+        text_result = entry.get("text_result")
 
-        assert isinstance(payloads, list) and payloads
-        assert isinstance(payloads[0], dict)
-        assert str(payloads[0].get("text", "")).strip()
+        assert isinstance(context_result, str) and context_result.strip()
+        lower_context = context_result.lower()
+        assert "germany" in lower_context or "netherlands" in lower_context
+
+        assert isinstance(text_result, list) and text_result
+        first_text = text_result[0]
+        assert isinstance(first_text, dict)
+        assert str(first_text.get("text", "")).strip()
 
 
 @pytest.mark.asyncio
 async def test_e2e_graph_side_effects_and_node_fields(e2e_state):
-    """Search interactions create expected graph nodes/edges and required fields."""
+    """Graph snapshot from e2e run has expected structure (nodes and edges from cognify)."""
     graph = e2e_state["graph_snapshot"]
     nodes, edges = graph
 
     type_counts = Counter(node_data[1].get("type", {}) for node_data in nodes)
-    edge_type_counts = Counter(edge_type[2] for edge_type in edges)
 
-    assert type_counts.get("CogneeUserInteraction", 0) == 4
-    assert type_counts.get("CogneeUserFeedback", 0) == 2
-    assert type_counts.get("NodeSet", 0) == 2
-    assert edge_type_counts.get("used_graph_element_to_answer", 0) >= 10
-    assert edge_type_counts.get("gives_feedback_to", 0) == 2
-    assert edge_type_counts.get("belongs_to_set", 0) >= 6
-
-    required_fields_user_interaction = {"question", "answer", "context"}
-    required_fields_feedback = {"feedback", "sentiment"}
-
-    for node_id, data in nodes:
-        if data.get("type") == "CogneeUserInteraction":
-            assert required_fields_user_interaction.issubset(data.keys())
-            for field in required_fields_user_interaction:
-                value = data[field]
-                assert isinstance(value, str) and value.strip()
-
-        if data.get("type") == "CogneeUserFeedback":
-            assert required_fields_feedback.issubset(data.keys())
-            for field in required_fields_feedback:
-                value = data[field]
-                assert isinstance(value, str) and value.strip()
-
-
-@pytest.mark.asyncio
-async def test_e2e_feedback_weight_calculation(feedback_state):
-    """Positive feedback increases used_graph_element_to_answer feedback_weight."""
-    _nodes, edges = feedback_state["graph_snapshot"]
-    for _from_node, _to_node, relationship_name, properties in edges:
-        if relationship_name == "used_graph_element_to_answer":
-            assert properties["feedback_weight"] >= 6, (
-                "Feedback weight calculation is not correct, it should be more then 6."
-            )
+    assert type_counts.get("Entity", 0) >= 1, "expected at least one Entity from cognify"
+    assert len(nodes) >= 1
+    assert len(edges) >= 1

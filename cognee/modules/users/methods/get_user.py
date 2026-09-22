@@ -1,9 +1,11 @@
 from uuid import UUID
+
 from sqlalchemy import select
 from sqlalchemy.orm import selectinload
-import sqlalchemy.exc
-from cognee.infrastructure.databases.relational import get_relational_engine
+
 from cognee.infrastructure.databases.exceptions import EntityNotFoundError
+from cognee.infrastructure.databases.relational import get_relational_engine
+
 from ..models import User
 
 

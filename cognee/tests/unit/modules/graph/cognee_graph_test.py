@@ -1,9 +1,11 @@
-import pytest
 from unittest.mock import AsyncMock
 
-from cognee.modules.graph.exceptions import EntityNotFoundError, EntityAlreadyExistsError
+import pytest
+
 from cognee.modules.graph.cognee_graph.CogneeGraph import CogneeGraph
 from cognee.modules.graph.cognee_graph.CogneeGraphElements import Edge, Node
+from cognee.modules.graph.exceptions import EntityNotFoundError
+from cognee.modules.graph.models.EdgeType import EdgeType
 
 
 @pytest.fixture
@@ -45,12 +47,14 @@ def test_add_node_success(setup_graph):
 
 
 def test_add_duplicate_node(setup_graph):
-    """Test adding a duplicate node raises an exception."""
+    """Test adding a duplicate node is silently skipped."""
     graph = setup_graph
-    node = Node("node1")
-    graph.add_node(node)
-    with pytest.raises(EntityAlreadyExistsError, match="Node with id node1 already exists."):
-        graph.add_node(node)
+    node1 = Node("node1")
+    graph.add_node(node1)
+    # Adding duplicate should be a no-op (keeps first occurrence)
+    node1_dup = Node("node1")
+    graph.add_node(node1_dup)
+    assert graph.get_node("node1") is node1
 
 
 def test_add_edge_success(setup_graph):
@@ -228,12 +232,39 @@ async def test_project_graph_from_db_stores_triplet_penalty_on_graph(mock_adapte
         edge_properties_to_project=[],
     )
 
-    assert graph2.triplet_distance_penalty == 3.5
+    assert graph2.triplet_distance_penalty == 6.5
 
 
 @pytest.mark.asyncio
-async def test_project_graph_from_db_missing_nodes(setup_graph, mock_adapter):
-    """Test that edges referencing missing nodes raise error."""
+async def test_project_graph_from_db_stores_feedback_influence_on_graph(mock_adapter):
+    """Test that project_graph_from_db stores feedback_influence on the graph."""
+    nodes_data = [("1", {"name": "Node1"})]
+    edges_data = [("1", "1", "SELF", {})]
+
+    mock_adapter.get_graph_data = AsyncMock(return_value=(nodes_data, edges_data))
+
+    graph = CogneeGraph()
+    await graph.project_graph_from_db(
+        adapter=mock_adapter,
+        node_properties_to_project=["name"],
+        edge_properties_to_project=[],
+        feedback_influence=0.3,
+    )
+
+    assert graph.feedback_influence == 0.3
+
+
+@pytest.mark.asyncio
+async def test_project_graph_from_db_missing_nodes_are_skipped(setup_graph, mock_adapter, caplog):
+    """Edges referencing missing nodes are skipped (logged at debug), not raised.
+
+    Real-world graphs frequently have edges that reference nodes filtered out
+    by node_properties_to_project or label filters. Raising would abort the
+    entire projection. We skip the edge and continue, mirroring the pattern
+    introduced for duplicate nodes in PR #2485. See issue #2897.
+    """
+    import logging
+
     graph = setup_graph
 
     nodes_data = [
@@ -241,16 +272,24 @@ async def test_project_graph_from_db_missing_nodes(setup_graph, mock_adapter):
     ]
     edges_data = [
         ("1", "999", "CONNECTS_TO", {"relationship_name": "connects"}),
+        ("1", "1", "SELF", {"relationship_name": "self"}),
     ]
 
     mock_adapter.get_graph_data = AsyncMock(return_value=(nodes_data, edges_data))
 
-    with pytest.raises(EntityNotFoundError, match="Edge references nonexistent nodes"):
+    with caplog.at_level(logging.DEBUG, logger="CogneeGraph"):
         await graph.project_graph_from_db(
             adapter=mock_adapter,
             node_properties_to_project=["name"],
             edge_properties_to_project=["relationship_name"],
         )
+
+    # The valid self-edge survives; the dangling edge is dropped.
+    assert len(graph.edges) == 1
+    assert any(
+        "Skipping edge with unprojectable endpoints" in rec.message and "999" in rec.message
+        for rec in caplog.records
+    ), "expected a debug log entry for the skipped dangling edge"
 
 
 @pytest.mark.asyncio
@@ -299,7 +338,7 @@ async def test_map_vector_distances_partial_node_coverage(setup_graph):
 
     assert graph.get_node("1").attributes.get("vector_distance") == [0.95]
     assert graph.get_node("2").attributes.get("vector_distance") == [0.87]
-    assert graph.get_node("3").attributes.get("vector_distance") == [3.5]
+    assert graph.get_node("3").attributes.get("vector_distance") == [6.5]
 
 
 @pytest.mark.asyncio
@@ -332,7 +371,7 @@ async def test_map_vector_distances_multiple_categories(setup_graph):
     assert graph.get_node("1").attributes.get("vector_distance") == [0.95]
     assert graph.get_node("2").attributes.get("vector_distance") == [0.87]
     assert graph.get_node("3").attributes.get("vector_distance") == [0.92]
-    assert graph.get_node("4").attributes.get("vector_distance") == [3.5]
+    assert graph.get_node("4").attributes.get("vector_distance") == [6.5]
 
 
 @pytest.mark.asyncio
@@ -356,9 +395,9 @@ async def test_map_vector_distances_to_graph_nodes_multi_query(setup_graph):
 
     await graph.map_vector_distances_to_graph_nodes(node_distances, query_list_length=2)
 
-    assert graph.get_node("1").attributes.get("vector_distance") == [0.95, 3.5]
-    assert graph.get_node("2").attributes.get("vector_distance") == [3.5, 0.87]
-    assert graph.get_node("3").attributes.get("vector_distance") == [3.5, 3.5]
+    assert graph.get_node("1").attributes.get("vector_distance") == [0.95, 6.5]
+    assert graph.get_node("2").attributes.get("vector_distance") == [6.5, 0.87]
+    assert graph.get_node("3").attributes.get("vector_distance") == [6.5, 6.5]
 
 
 @pytest.mark.asyncio
@@ -379,7 +418,7 @@ async def test_map_vector_distances_to_graph_edges_with_payload(setup_graph):
     graph.add_edge(edge)
 
     edge_distances = [
-        MockScoredResult("e1", 0.92, payload={"text": "CONNECTS_TO"}),
+        MockScoredResult(EdgeType.id_for("CONNECTS_TO"), 0.92, payload={"text": "CONNECTS_TO"}),
     ]
 
     await graph.map_vector_distances_to_graph_edges(edge_distances=edge_distances)
@@ -404,14 +443,15 @@ async def test_map_vector_distances_partial_edge_coverage(setup_graph):
     graph.add_edge(edge1)
     graph.add_edge(edge2)
 
+    edge_1_text = "CONNECTS_TO"
     edge_distances = [
-        MockScoredResult("e1", 0.92, payload={"text": "CONNECTS_TO"}),
+        MockScoredResult(EdgeType.id_for(edge_1_text), 0.92, payload={"text": edge_1_text}),
     ]
 
     await graph.map_vector_distances_to_graph_edges(edge_distances=edge_distances)
 
     assert graph.edges[0].attributes.get("vector_distance") == [0.92]
-    assert graph.edges[1].attributes.get("vector_distance") == [3.5]
+    assert graph.edges[1].attributes.get("vector_distance") == [6.5]
 
 
 @pytest.mark.asyncio
@@ -431,8 +471,9 @@ async def test_map_vector_distances_edges_fallback_to_relationship_type(setup_gr
     )
     graph.add_edge(edge)
 
+    edge_text = "KNOWS"
     edge_distances = [
-        MockScoredResult("e1", 0.85, payload={"text": "KNOWS"}),
+        MockScoredResult(EdgeType.id_for(edge_text), 0.85, payload={"text": edge_text}),
     ]
 
     await graph.map_vector_distances_to_graph_edges(edge_distances=edge_distances)
@@ -457,13 +498,14 @@ async def test_map_vector_distances_no_edge_matches(setup_graph):
     )
     graph.add_edge(edge)
 
+    edge_text = "SOME_OTHER_EDGE"
     edge_distances = [
-        MockScoredResult("e1", 0.92, payload={"text": "SOME_OTHER_EDGE"}),
+        MockScoredResult(EdgeType.id_for(edge_text), 0.92, payload={"text": edge_text}),
     ]
 
     await graph.map_vector_distances_to_graph_edges(edge_distances=edge_distances)
 
-    assert graph.edges[0].attributes.get("vector_distance") == [3.5]
+    assert graph.edges[0].attributes.get("vector_distance") == [6.5]
 
 
 @pytest.mark.asyncio
@@ -476,7 +518,7 @@ async def test_map_vector_distances_none_returns_early(setup_graph):
 
     await graph.map_vector_distances_to_graph_edges(edge_distances=None)
 
-    assert graph.edges[0].attributes.get("vector_distance") == [3.5]
+    assert graph.edges[0].attributes.get("vector_distance") == [6.5]
 
 
 @pytest.mark.asyncio
@@ -490,8 +532,8 @@ async def test_map_vector_distances_empty_nodes_returns_early(setup_graph):
 
     await graph.map_vector_distances_to_graph_nodes({})
 
-    assert node1.attributes.get("vector_distance") == [3.5]
-    assert node2.attributes.get("vector_distance") == [3.5]
+    assert node1.attributes.get("vector_distance") == [6.5]
+    assert node2.attributes.get("vector_distance") == [6.5]
 
 
 @pytest.mark.asyncio
@@ -511,17 +553,23 @@ async def test_map_vector_distances_to_graph_edges_multi_query(setup_graph):
     graph.add_edge(edge1)
     graph.add_edge(edge2)
 
+    edge_1_text = "A"
+    edge_2_text = "B"
     edge_distances = [
-        [MockScoredResult("e1", 0.1, payload={"text": "A"})],  # query 0
-        [MockScoredResult("e2", 0.2, payload={"text": "B"})],  # query 1
+        [
+            MockScoredResult(EdgeType.id_for(edge_1_text), 0.1, payload={"text": edge_1_text})
+        ],  # query 0
+        [
+            MockScoredResult(EdgeType.id_for(edge_2_text), 0.2, payload={"text": edge_2_text})
+        ],  # query 1
     ]
 
     await graph.map_vector_distances_to_graph_edges(
         edge_distances=edge_distances, query_list_length=2
     )
 
-    assert graph.edges[0].attributes.get("vector_distance") == [0.1, 3.5]
-    assert graph.edges[1].attributes.get("vector_distance") == [3.5, 0.2]
+    assert graph.edges[0].attributes.get("vector_distance") == [0.1, 6.5]
+    assert graph.edges[1].attributes.get("vector_distance") == [6.5, 0.2]
 
 
 @pytest.mark.asyncio
@@ -541,8 +589,11 @@ async def test_map_vector_distances_to_graph_edges_preserves_unmapped_indices(se
     graph.add_edge(edge1)
     graph.add_edge(edge2)
 
+    edge_1_text = "A"
     edge_distances = [
-        [MockScoredResult("e1", 0.1, payload={"text": "A"})],  # query 0: only edge1 mapped
+        [
+            MockScoredResult(EdgeType.id_for(edge_1_text), 0.1, payload={"text": edge_1_text})
+        ],  # query 0: only edge1 mapped
         [],  # query 1: no edges mapped
     ]
 
@@ -550,8 +601,8 @@ async def test_map_vector_distances_to_graph_edges_preserves_unmapped_indices(se
         edge_distances=edge_distances, query_list_length=2
     )
 
-    assert graph.edges[0].attributes.get("vector_distance") == [0.1, 3.5]
-    assert graph.edges[1].attributes.get("vector_distance") == [3.5, 3.5]
+    assert graph.edges[0].attributes.get("vector_distance") == [0.1, 6.5]
+    assert graph.edges[1].attributes.get("vector_distance") == [6.5, 6.5]
 
 
 @pytest.mark.asyncio
@@ -679,6 +730,328 @@ async def test_calculate_top_triplet_importances_multi_query(setup_graph):
 
 
 @pytest.mark.asyncio
+async def test_calculate_top_triplet_importances_with_feedback_influence_prefers_higher_weight(
+    setup_graph,
+):
+    """Test feedback-based scoring prefers larger feedback_weight for equal distances."""
+    graph = setup_graph
+
+    node1 = Node("1", {"feedback_weight": 0.9})
+    node2 = Node("2", {"feedback_weight": 0.9})
+    node3 = Node("3", {"feedback_weight": 0.2})
+    graph.add_node(node1)
+    graph.add_node(node2)
+    graph.add_node(node3)
+
+    edge_high = Edge(node1, node2, attributes={"feedback_weight": 0.9})
+    edge_low = Edge(node2, node3, attributes={"feedback_weight": 0.2})
+    graph.add_edge(edge_high)
+    graph.add_edge(edge_low)
+
+    node1.add_attribute("vector_distance", [0.4])
+    node2.add_attribute("vector_distance", [0.4])
+    node3.add_attribute("vector_distance", [0.4])
+    edge_high.add_attribute("vector_distance", [0.4])
+    edge_low.add_attribute("vector_distance", [0.4])
+
+    results = await graph.calculate_top_triplet_importances(k=1, feedback_influence=0.5)
+
+    assert len(results) == 1
+    assert results[0] == edge_high
+
+
+@pytest.mark.asyncio
+async def test_calculate_top_triplet_importances_feedback_missing_defaults_to_half(setup_graph):
+    """Test missing feedback_weight uses default 0.5."""
+    graph = setup_graph
+
+    node1 = Node("1")
+    node2 = Node("2")
+    node3 = Node("3")
+    graph.add_node(node1)
+    graph.add_node(node2)
+    graph.add_node(node3)
+
+    edge_default = Edge(node1, node2)
+    edge_low = Edge(node2, node3, attributes={"feedback_weight": 0.2})
+    graph.add_edge(edge_default)
+    graph.add_edge(edge_low)
+
+    node1.add_attribute("vector_distance", [0.4])
+    node2.add_attribute("vector_distance", [0.4])
+    node3.add_attribute("vector_distance", [0.4])
+    edge_default.add_attribute("vector_distance", [0.4])
+    edge_low.add_attribute("vector_distance", [0.4])
+
+    results = await graph.calculate_top_triplet_importances(k=1, feedback_influence=1.0)
+
+    assert len(results) == 1
+    assert results[0] == edge_default
+
+
+@pytest.mark.asyncio
+async def test_calculate_top_triplet_importances_uses_graph_default_feedback_influence(
+    setup_graph,
+):
+    """Test stored graph.feedback_influence is used when no override is provided."""
+    graph = setup_graph
+    graph.feedback_influence = 1.0
+
+    node1 = Node("1", {"feedback_weight": 1.0})
+    node2 = Node("2", {"feedback_weight": 1.0})
+    node3 = Node("3", {"feedback_weight": 0.0})
+    graph.add_node(node1)
+    graph.add_node(node2)
+    graph.add_node(node3)
+
+    edge_high_feedback = Edge(node1, node2, attributes={"feedback_weight": 1.0})
+    edge_low_feedback = Edge(node2, node3, attributes={"feedback_weight": 0.0})
+    graph.add_edge(edge_high_feedback)
+    graph.add_edge(edge_low_feedback)
+
+    node1.add_attribute("vector_distance", [0.9])
+    node2.add_attribute("vector_distance", [0.9])
+    node3.add_attribute("vector_distance", [0.9])
+    edge_high_feedback.add_attribute("vector_distance", [0.9])
+    edge_low_feedback.add_attribute("vector_distance", [0.1])
+
+    results = await graph.calculate_top_triplet_importances(k=1)
+
+    assert len(results) == 1
+    assert results[0] == edge_high_feedback
+
+
+@pytest.mark.asyncio
+async def test_calculate_top_triplet_importances_override_disables_graph_default_feedback(
+    setup_graph,
+):
+    """Test explicit feedback_influence override takes precedence over stored graph default."""
+    graph = setup_graph
+    graph.feedback_influence = 1.0
+
+    node1 = Node("1", {"feedback_weight": 1.0})
+    node2 = Node("2", {"feedback_weight": 1.0})
+    node3 = Node("3", {"feedback_weight": 0.0})
+    graph.add_node(node1)
+    graph.add_node(node2)
+    graph.add_node(node3)
+
+    edge_high_feedback = Edge(node1, node2, attributes={"feedback_weight": 1.0})
+    edge_low_distance = Edge(node2, node3, attributes={"feedback_weight": 0.0})
+    graph.add_edge(edge_high_feedback)
+    graph.add_edge(edge_low_distance)
+
+    node1.add_attribute("vector_distance", [0.9])
+    node2.add_attribute("vector_distance", [0.1])
+    node3.add_attribute("vector_distance", [0.1])
+    edge_high_feedback.add_attribute("vector_distance", [0.9])
+    edge_low_distance.add_attribute("vector_distance", [0.1])
+
+    results = await graph.calculate_top_triplet_importances(k=1, feedback_influence=0.0)
+
+    assert len(results) == 1
+    assert results[0] == edge_low_distance
+
+
+@pytest.mark.asyncio
+async def test_calculate_top_triplet_importances_clamps_and_coerces_feedback_weights(setup_graph):
+    """Test score calculation clamps out-of-range weights and defaults invalid values to 0.5."""
+    graph = setup_graph
+
+    node1 = Node("1", {"feedback_weight": "not-a-number"})
+    node2 = Node("2", {"feedback_weight": 2.0})
+    node3 = Node("3", {"feedback_weight": -5.0})
+    graph.add_node(node1)
+    graph.add_node(node2)
+    graph.add_node(node3)
+
+    edge_invalid = Edge(node1, node2, attributes={"feedback_weight": "bad"})
+    edge_clamped_low = Edge(node2, node3, attributes={"feedback_weight": -2.0})
+    graph.add_edge(edge_invalid)
+    graph.add_edge(edge_clamped_low)
+
+    node1.add_attribute("vector_distance", [0.9])
+    node2.add_attribute("vector_distance", [0.9])
+    node3.add_attribute("vector_distance", [0.9])
+    edge_invalid.add_attribute("vector_distance", [0.9])
+    edge_clamped_low.add_attribute("vector_distance", [0.9])
+
+    results = await graph.calculate_top_triplet_importances(k=2, feedback_influence=1.0)
+
+    assert results == [edge_invalid, edge_clamped_low]
+
+
+@pytest.mark.asyncio
+async def test_calculate_top_triplet_importances_blends_distance_with_feedback_influence(
+    setup_graph,
+):
+    """Test mid-range feedback_influence uses the weighted blend formula."""
+    graph = setup_graph
+
+    node1 = Node("1", {"feedback_weight": 1.0})
+    node2 = Node("2", {"feedback_weight": 1.0})
+    node3 = Node("3", {"feedback_weight": 0.0})
+    graph.add_node(node1)
+    graph.add_node(node2)
+    graph.add_node(node3)
+
+    edge_feedback_favored = Edge(node1, node2, attributes={"feedback_weight": 1.0})
+    edge_distance_favored = Edge(node2, node3, attributes={"feedback_weight": 0.0})
+    graph.add_edge(edge_feedback_favored)
+    graph.add_edge(edge_distance_favored)
+
+    node1.add_attribute("vector_distance", [0.6])
+    node2.add_attribute("vector_distance", [0.6])
+    node3.add_attribute("vector_distance", [0.2])
+    edge_feedback_favored.add_attribute("vector_distance", [0.6])
+    edge_distance_favored.add_attribute("vector_distance", [0.2])
+
+    distance_only_results = await graph.calculate_top_triplet_importances(
+        k=1, feedback_influence=0.0
+    )
+    blended_results = await graph.calculate_top_triplet_importances(k=1, feedback_influence=0.75)
+
+    assert distance_only_results == [edge_distance_favored]
+    assert blended_results == [edge_feedback_favored]
+
+
+@pytest.mark.asyncio
+async def test_feedback_blend_uses_cosine_distance_scale(setup_graph):
+    """At mid influence, feedback term should be weighted on cosine [0, 2] scale."""
+    graph = setup_graph
+
+    node1 = Node("1", {"feedback_weight": 1.0, "importance_weight": 1.0})
+    node2 = Node("2", {"feedback_weight": 1.0, "importance_weight": 1.0})
+    node3 = Node("3", {"feedback_weight": 0.0, "importance_weight": 1.0})
+    node4 = Node("4", {"feedback_weight": 0.0, "importance_weight": 1.0})
+    graph.add_node(node1)
+    graph.add_node(node2)
+    graph.add_node(node3)
+    graph.add_node(node4)
+
+    edge_high_feedback = Edge(
+        node1, node2, attributes={"feedback_weight": 1.0, "importance_weight": 1.0}
+    )
+    edge_low_feedback = Edge(
+        node3, node4, attributes={"feedback_weight": 0.0, "importance_weight": 1.0}
+    )
+    graph.add_edge(edge_high_feedback)
+    graph.add_edge(edge_low_feedback)
+
+    # Distance-only prefers edge_low_feedback.
+    node1.add_attribute("vector_distance", [1.8])
+    node2.add_attribute("vector_distance", [1.8])
+    edge_high_feedback.add_attribute("vector_distance", [1.8])
+
+    node3.add_attribute("vector_distance", [0.4])
+    node4.add_attribute("vector_distance", [0.4])
+    edge_low_feedback.add_attribute("vector_distance", [0.4])
+
+    distance_only = await graph.calculate_top_triplet_importances(k=1, feedback_influence=0.0)
+    blended = await graph.calculate_top_triplet_importances(k=1, feedback_influence=0.5)
+
+    assert distance_only == [edge_low_feedback]
+    assert blended == [edge_high_feedback]
+
+
+@pytest.mark.asyncio
+async def test_feedback_blend_preserves_distance_order_when_feedback_weights_match(setup_graph):
+    """Equal feedback weights should preserve pure distance ordering on cosine scale."""
+    graph = setup_graph
+
+    node1 = Node("1", {"feedback_weight": 0.4})
+    node2 = Node("2", {"feedback_weight": 0.4})
+    node3 = Node("3", {"feedback_weight": 0.4})
+    node4 = Node("4", {"feedback_weight": 0.4})
+    graph.add_node(node1)
+    graph.add_node(node2)
+    graph.add_node(node3)
+    graph.add_node(node4)
+
+    edge_close = Edge(node1, node2, attributes={"feedback_weight": 0.4})
+    edge_far = Edge(node3, node4, attributes={"feedback_weight": 0.4})
+    graph.add_edge(edge_close)
+    graph.add_edge(edge_far)
+
+    node1.add_attribute("vector_distance", [0.3])
+    node2.add_attribute("vector_distance", [0.3])
+    edge_close.add_attribute("vector_distance", [0.3])
+
+    node3.add_attribute("vector_distance", [1.7])
+    node4.add_attribute("vector_distance", [1.7])
+    edge_far.add_attribute("vector_distance", [1.7])
+
+    distance_only = await graph.calculate_top_triplet_importances(k=1, feedback_influence=0.0)
+    blended = await graph.calculate_top_triplet_importances(k=1, feedback_influence=0.8)
+
+    assert distance_only == [edge_close]
+    assert blended == [edge_close]
+
+
+@pytest.mark.asyncio
+async def test_missing_distance_penalty_ranks_below_max_real_triplet(setup_graph):
+    """Fallback penalty 6.5 must rank behind any fully-matched max-cosine triplet (<= 6.0)."""
+    graph = setup_graph
+
+    node1 = Node("1")
+    node2 = Node("2")
+    node3 = Node("3")
+    graph.add_node(node1)
+    graph.add_node(node2)
+    graph.add_node(node3)
+
+    edge_real = Edge(node1, node2, attributes={"edge_text": "A"})
+    edge_fallback = Edge(node2, node3, attributes={"edge_text": "B"})
+    graph.add_edge(edge_real)
+    graph.add_edge(edge_fallback)
+
+    await graph.map_vector_distances_to_graph_nodes(
+        {"Entity_name": [MockScoredResult("1", 2.0), MockScoredResult("2", 2.0)]}
+    )
+    await graph.map_vector_distances_to_graph_edges(
+        [MockScoredResult(EdgeType.id_for("A"), 2.0, payload={"text": "A"})]
+    )
+
+    ranked = await graph.calculate_top_triplet_importances(k=2, feedback_influence=0.0)
+
+    assert node3.attributes.get("vector_distance") == [6.5]
+    assert edge_fallback.attributes.get("vector_distance") == [6.5]
+    assert ranked == [edge_real, edge_fallback]
+
+
+@pytest.mark.asyncio
+async def test_feedback_blend_does_not_reduce_fallback_penalty(setup_graph):
+    """Fallback penalty must not be blended into cosine range by feedback."""
+    graph = setup_graph
+
+    node1 = Node("1", {"feedback_weight": 1.0})
+    node2 = Node("2", {"feedback_weight": 1.0})
+    node3 = Node("3", {"feedback_weight": 1.0})
+    graph.add_node(node1)
+    graph.add_node(node2)
+    graph.add_node(node3)
+
+    edge_fallback = Edge(node1, node2, attributes={"feedback_weight": 1.0})
+    edge_real = Edge(node2, node3, attributes={"feedback_weight": 1.0})
+    graph.add_edge(edge_fallback)
+    graph.add_edge(edge_real)
+
+    # Fallback triplet: all components at penalty.
+    node1.add_attribute("vector_distance", [6.5])
+    node2.add_attribute("vector_distance", [6.5])
+    edge_fallback.add_attribute("vector_distance", [6.5])
+
+    # Real triplet: all components at max valid cosine distance.
+    node3.add_attribute("vector_distance", [2.0])
+    edge_real.add_attribute("vector_distance", [2.0])
+
+    results = await graph.calculate_top_triplet_importances(k=2, feedback_influence=1.0)
+
+    # If fallback were blended, it could incorrectly outrank real matches.
+    assert results == [edge_real, edge_fallback]
+
+
+@pytest.mark.asyncio
 async def test_calculate_top_triplet_importances_raises_on_short_list(setup_graph):
     """Test that scoring raises ValueError when list is too short for query_index."""
     graph = setup_graph
@@ -718,6 +1091,183 @@ async def test_calculate_top_triplet_importances_raises_on_missing_attribute(set
 
     with pytest.raises(ValueError):
         await graph.calculate_top_triplet_importances(k=1, query_list_length=1)
+
+
+# ---------------------------------------------------------------------------
+# Personal prefers weights (user preferences, Phase 5)
+# ---------------------------------------------------------------------------
+
+
+def test_apply_personal_weights_matches_by_node_id_and_ignores_unknown_ids(setup_graph):
+    """Weights land on nodes matched by id; unknown ids neither raise nor create nodes."""
+    graph = setup_graph
+    node1 = Node("1")
+    node2 = Node("2")
+    graph.add_node(node1)
+    graph.add_node(node2)
+
+    graph.apply_personal_weights({"1": 0.9, "ghost": 0.1})
+
+    assert node1.attributes.get("personal_weight") == 0.9
+    assert node2.attributes.get("personal_weight") is None
+    assert "ghost" not in graph.nodes
+
+
+def test_apply_personal_weights_empty_map_is_a_no_op(setup_graph):
+    """An empty weight map touches nothing."""
+    graph = setup_graph
+    node1 = Node("1")
+    graph.add_node(node1)
+
+    graph.apply_personal_weights({})
+
+    assert node1.attributes.get("personal_weight") is None
+
+
+@pytest.mark.asyncio
+async def test_personal_weight_leaves_penalty_distance_untouched(setup_graph):
+    """A fallback-penalty triplet must not be scaled by a strong personal weight.
+
+    Run with feedback_influence=0: there _effective_distance short-circuits
+    without ever consulting its range guard, so the eligibility test lives
+    only in the personal-distance code — which is where it could be dropped.
+    Both edges sit at the same penalty score, so if the weighted one were
+    scaled it would jump ahead; correct behavior preserves insertion order.
+    """
+    graph = setup_graph
+    graph.personal_influence = 1.0
+
+    node1 = Node("1", {"importance_weight": 1.0})
+    node2 = Node("2", {"importance_weight": 1.0})
+    node3 = Node("3", {"importance_weight": 1.0})
+    node4 = Node("4", {"importance_weight": 1.0})
+    for node in (node1, node2, node3, node4):
+        graph.add_node(node)
+
+    edge_plain = Edge(node1, node2, attributes={"importance_weight": 1.0})
+    edge_weighted = Edge(node3, node4, attributes={"importance_weight": 1.0})
+    graph.add_edge(edge_plain)
+    graph.add_edge(edge_weighted)
+
+    # Every component sits at the fallback penalty.
+    for element in (node1, node2, node3, node4, edge_plain, edge_weighted):
+        element.add_attribute("vector_distance", [6.5])
+
+    graph.apply_personal_weights({"3": 0.95, "4": 0.95})
+
+    results = await graph.calculate_top_triplet_importances(k=2, feedback_influence=0.0)
+
+    assert results == [edge_plain, edge_weighted]
+
+
+@pytest.mark.asyncio
+async def test_personal_weight_neutral_is_an_exact_no_op(setup_graph):
+    """personal_factor(0.5, influence) is exactly 1.0, so a tie stays a tie."""
+    graph = setup_graph
+    graph.personal_influence = 1.0
+
+    node1 = Node("1")
+    node2 = Node("2")
+    node3 = Node("3")
+    node4 = Node("4")
+    for node in (node1, node2, node3, node4):
+        graph.add_node(node)
+
+    edge_first = Edge(node1, node2)
+    edge_second = Edge(node3, node4)
+    graph.add_edge(edge_first)
+    graph.add_edge(edge_second)
+
+    # Real cosine distances, identical across both triplets.
+    for element in (node1, node2, node3, node4, edge_first, edge_second):
+        element.add_attribute("vector_distance", [0.4])
+
+    graph.apply_personal_weights({"3": 0.5, "4": 0.5})
+
+    results = await graph.calculate_top_triplet_importances(k=2, feedback_influence=0.0)
+
+    # Any factor even epsilon below 1.0 would flip this ordering; the exact
+    # no-op preserves insertion order through the stable sort.
+    assert results == [edge_first, edge_second]
+
+
+@pytest.mark.asyncio
+async def test_personal_weight_ignored_at_zero_influence(setup_graph):
+    """influence <= 0 returns the blended distance untouched, weight or not."""
+    graph = setup_graph
+    graph.personal_influence = 0.0
+
+    node1 = Node("1")
+    node2 = Node("2")
+    node3 = Node("3")
+    node4 = Node("4")
+    for node in (node1, node2, node3, node4):
+        graph.add_node(node)
+
+    edge_first = Edge(node1, node2)
+    edge_second = Edge(node3, node4)
+    graph.add_edge(edge_first)
+    graph.add_edge(edge_second)
+
+    for element in (node1, node2, node3, node4, edge_first, edge_second):
+        element.add_attribute("vector_distance", [0.4])
+
+    graph.apply_personal_weights({"3": 0.95, "4": 0.95})
+
+    results = await graph.calculate_top_triplet_importances(k=2, feedback_influence=0.0)
+
+    assert results == [edge_first, edge_second]
+
+
+@pytest.mark.asyncio
+async def test_personal_and_feedback_influences_compose_multiplicatively(setup_graph):
+    """Both knobs on: the personal factor scales the feedback-blended distance.
+
+    All components sit at raw distance 1.0 (importance_weight 1.0 keeps it
+    unscaled). With feedback_influence=0.5 and personal_influence=0.5, the
+    hand-computed per-edge sums are:
+
+    - both signals:    node 1.0 -> blended 0.5 -> x0.5 = 0.25; edge 0.5; sum 1.0
+    - feedback only:   node 0.5, edge 0.5; sum 1.5
+    - personal only:   node blended 1.0 -> x0.5 = 0.5; edge 1.0; sum 2.0
+    - neither:         1.0 each; sum 3.0
+
+    Only blend-then-multiply produces this strict ordering.
+    """
+    graph = setup_graph
+    graph.personal_influence = 0.5
+
+    nodes = {}
+    for index in range(1, 9):
+        node_id = str(index)
+        attrs = {"importance_weight": 1.0}
+        if index in (1, 2, 3, 4):
+            attrs["feedback_weight"] = 1.0
+        node = Node(node_id, attrs)
+        nodes[node_id] = node
+        graph.add_node(node)
+
+    edge_both = Edge(
+        nodes["1"], nodes["2"], attributes={"feedback_weight": 1.0, "importance_weight": 1.0}
+    )
+    edge_feedback_only = Edge(
+        nodes["3"], nodes["4"], attributes={"feedback_weight": 1.0, "importance_weight": 1.0}
+    )
+    edge_personal_only = Edge(nodes["5"], nodes["6"], attributes={"importance_weight": 1.0})
+    edge_neither = Edge(nodes["7"], nodes["8"], attributes={"importance_weight": 1.0})
+    for edge in (edge_both, edge_feedback_only, edge_personal_only, edge_neither):
+        graph.add_edge(edge)
+
+    for node in nodes.values():
+        node.add_attribute("vector_distance", [1.0])
+    for edge in (edge_both, edge_feedback_only, edge_personal_only, edge_neither):
+        edge.add_attribute("vector_distance", [1.0])
+
+    graph.apply_personal_weights({"1": 1.0, "2": 1.0, "5": 1.0, "6": 1.0})
+
+    results = await graph.calculate_top_triplet_importances(k=4, feedback_influence=0.5)
+
+    assert results == [edge_both, edge_feedback_only, edge_personal_only, edge_neither]
 
 
 def test_normalize_query_distance_lists_flat_list_single_query(setup_graph):

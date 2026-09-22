@@ -1,11 +1,11 @@
 import argparse
 import asyncio
-from typing import Optional
 
-from cognee.cli.reference import SupportsCliCommand
-from cognee.cli import DEFAULT_DOCS_URL
 import cognee.cli.echo as fmt
+from cognee.cli import DEFAULT_DOCS_URL
 from cognee.cli.exceptions import CliCommandException, CliCommandInnerException
+from cognee.cli.reference import SupportsCliCommand
+from cognee.modules.data.constants import DEFAULT_DATASET_NAME
 
 
 class AddCommand(SupportsCliCommand):
@@ -46,7 +46,7 @@ After adding data, use `cognee cognify` to process it into knowledge graphs.
         parser.add_argument(
             "--dataset-name",
             "-d",
-            default="main_dataset",
+            default=DEFAULT_DATASET_NAME,
             help="Dataset name to organize your data (default: main_dataset)",
         )
 
@@ -60,6 +60,10 @@ After adding data, use `cognee cognify` to process it into knowledge graphs.
             # Run the async add function
             async def run_add():
                 try:
+                    from cognee.cli.user_resolution import resolve_cli_user
+
+                    user = await resolve_cli_user(getattr(args, "user_id", None))
+
                     # Pass all data items as a list to cognee.add if multiple items
                     if len(args.data) == 1:
                         data_to_add = args.data[0]
@@ -67,14 +71,14 @@ After adding data, use `cognee cognify` to process it into knowledge graphs.
                         data_to_add = args.data
 
                     fmt.echo("Processing data...")
-                    await cognee.add(data=data_to_add, dataset_name=args.dataset_name)
+                    await cognee.add(data=data_to_add, dataset_name=args.dataset_name, user=user)
                     fmt.success(f"Successfully added data to dataset '{args.dataset_name}'")
                 except Exception as e:
-                    raise CliCommandInnerException(f"Failed to add data: {str(e)}") from e
+                    raise CliCommandInnerException(f"Failed to add data: {e!s}") from e
 
             asyncio.run(run_add())
 
         except Exception as e:
             if isinstance(e, CliCommandInnerException):
                 raise CliCommandException(str(e), error_code=1) from e
-            raise CliCommandException(f"Failed to add data: {str(e)}", error_code=1) from e
+            raise CliCommandException(f"Failed to add data: {e!s}", error_code=1) from e

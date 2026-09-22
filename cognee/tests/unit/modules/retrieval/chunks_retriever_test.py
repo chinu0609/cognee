@@ -1,9 +1,19 @@
-import pytest
-from unittest.mock import AsyncMock, patch, MagicMock
+from types import SimpleNamespace
+from unittest.mock import AsyncMock, MagicMock, patch
 
+import pytest
+
+from cognee.infrastructure.databases.vector.exceptions import CollectionNotFoundError
 from cognee.modules.retrieval.chunks_retriever import ChunksRetriever
 from cognee.modules.retrieval.exceptions.exceptions import NoDataError
-from cognee.infrastructure.databases.vector.exceptions import CollectionNotFoundError
+
+
+def _make_unified_mock(vector_engine):
+    """Create a mock UnifiedStoreEngine wrapping the given vector engine."""
+    unified = AsyncMock()
+    unified.vector = vector_engine
+    unified.graph = AsyncMock()
+    return unified
 
 
 @pytest.fixture
@@ -27,15 +37,63 @@ async def test_get_context_success(mock_vector_engine):
     retriever = ChunksRetriever(top_k=5)
 
     with patch(
-        "cognee.modules.retrieval.chunks_retriever.get_vector_engine",
-        return_value=mock_vector_engine,
+        "cognee.modules.retrieval.chunks_retriever.get_unified_engine",
+        return_value=_make_unified_mock(mock_vector_engine),
     ):
-        context = await retriever.get_context("test query")
+        objects = await retriever.get_retrieved_objects("test query")
 
-    assert len(context) == 2
-    assert context[0]["text"] == "Steve Rodger"
-    assert context[1]["text"] == "Mike Broski"
-    mock_vector_engine.search.assert_awaited_once_with("DocumentChunk_text", "test query", limit=5)
+    assert len(objects) == 2
+    assert objects[0].payload["text"] == "Steve Rodger"
+    assert objects[1].payload["text"] == "Mike Broski"
+    mock_vector_engine.search.assert_awaited_once_with(
+        "DocumentChunk_text",
+        "test query",
+        limit=5,
+        include_payload=True,
+        node_name=None,
+        node_name_filter_operator="OR",
+    )
+
+
+@pytest.mark.asyncio
+async def test_get_completion_from_context_includes_score(mock_vector_engine):
+    """Test that get_completion_from_context attaches each chunk's score to its payload."""
+    mock_result1 = MagicMock()
+    mock_result1.payload = {"text": "Steve Rodger", "chunk_index": 0}
+    mock_result1.score = 0.12
+    mock_result2 = MagicMock()
+    mock_result2.payload = {"text": "Mike Broski", "chunk_index": 1}
+    mock_result2.score = 0.34
+
+    mock_vector_engine.search.return_value = [mock_result1, mock_result2]
+
+    retriever = ChunksRetriever(top_k=5)
+
+    with patch(
+        "cognee.modules.retrieval.chunks_retriever.get_unified_engine",
+        return_value=_make_unified_mock(mock_vector_engine),
+    ):
+        retrieved_objects = await retriever.get_retrieved_objects("test query")
+        completion = await retriever.get_completion_from_context(
+            query="test query", retrieved_objects=retrieved_objects, context=None
+        )
+
+    assert completion[0]["score"] == 0.12
+    assert completion[0]["text"] == "Steve Rodger"
+    assert completion[1]["score"] == 0.34
+    assert completion[1]["text"] == "Mike Broski"
+
+
+@pytest.mark.asyncio
+async def test_get_completion_from_context_empty_returns_empty_list():
+    """Test that get_completion_from_context returns [] when there are no retrieved objects."""
+    retriever = ChunksRetriever()
+
+    completion = await retriever.get_completion_from_context(
+        query="test query", retrieved_objects=[], context=None
+    )
+
+    assert completion == []
 
 
 @pytest.mark.asyncio
@@ -45,12 +103,14 @@ async def test_get_context_collection_not_found_error(mock_vector_engine):
 
     retriever = ChunksRetriever()
 
-    with patch(
-        "cognee.modules.retrieval.chunks_retriever.get_vector_engine",
-        return_value=mock_vector_engine,
+    with (
+        patch(
+            "cognee.modules.retrieval.chunks_retriever.get_unified_engine",
+            return_value=_make_unified_mock(mock_vector_engine),
+        ),
+        pytest.raises(NoDataError, match="No data found"),
     ):
-        with pytest.raises(NoDataError, match="No data found"):
-            await retriever.get_context("test query")
+        await retriever.get_retrieved_objects("test query")
 
 
 @pytest.mark.asyncio
@@ -61,12 +121,12 @@ async def test_get_context_empty_results(mock_vector_engine):
     retriever = ChunksRetriever()
 
     with patch(
-        "cognee.modules.retrieval.chunks_retriever.get_vector_engine",
-        return_value=mock_vector_engine,
+        "cognee.modules.retrieval.chunks_retriever.get_unified_engine",
+        return_value=_make_unified_mock(mock_vector_engine),
     ):
-        context = await retriever.get_context("test query")
+        objects = await retriever.get_retrieved_objects("test query")
 
-    assert context == []
+    assert objects == []
 
 
 @pytest.mark.asyncio
@@ -81,43 +141,64 @@ async def test_get_context_top_k_limit(mock_vector_engine):
     retriever = ChunksRetriever(top_k=3)
 
     with patch(
-        "cognee.modules.retrieval.chunks_retriever.get_vector_engine",
-        return_value=mock_vector_engine,
+        "cognee.modules.retrieval.chunks_retriever.get_unified_engine",
+        return_value=_make_unified_mock(mock_vector_engine),
     ):
-        context = await retriever.get_context("test query")
+        objects = await retriever.get_retrieved_objects("test query")
 
-    assert len(context) == 3
-    mock_vector_engine.search.assert_awaited_once_with("DocumentChunk_text", "test query", limit=3)
+    assert len(objects) == 3
+    mock_vector_engine.search.assert_awaited_once_with(
+        "DocumentChunk_text",
+        "test query",
+        limit=3,
+        include_payload=True,
+        node_name=None,
+        node_name_filter_operator="OR",
+    )
 
 
 @pytest.mark.asyncio
-async def test_get_completion_with_context(mock_vector_engine):
+async def test_get_context_forwards_nodeset_filter_to_vector_search(mock_vector_engine):
+    """Test that node_name filtering is passed through to the vector engine."""
+    mock_vector_engine.search.return_value = []
+
+    retriever = ChunksRetriever(
+        top_k=30,
+        node_name=["KEN", "src_type:figure"],
+        node_name_filter_operator="AND",
+    )
+
+    with patch(
+        "cognee.modules.retrieval.chunks_retriever.get_unified_engine",
+        return_value=_make_unified_mock(mock_vector_engine),
+    ):
+        await retriever.get_retrieved_objects("land cover")
+
+    mock_vector_engine.search.assert_awaited_once_with(
+        "DocumentChunk_text",
+        "land cover",
+        limit=30,
+        include_payload=True,
+        node_name=["KEN", "src_type:figure"],
+        node_name_filter_operator="AND",
+    )
+
+
+@pytest.mark.asyncio
+async def test_get_context(mock_vector_engine):
     """Test get_completion returns provided context."""
     retriever = ChunksRetriever()
 
-    provided_context = [{"text": "Steve Rodger"}, {"text": "Mike Broski"}]
-    completion = await retriever.get_completion("test query", context=provided_context)
+    retrieved_objects = [
+        {"payload": {"text": "Steve Rodger"}},
+        {"payload": {"text": "Mike Broski"}},
+    ]
+    # Wrap the outer dictionary so payload is an attribute
+    mock_objects = [SimpleNamespace(**obj) for obj in retrieved_objects]
 
-    assert completion == provided_context
+    context = await retriever.get_context_from_objects("test query", retrieved_objects=mock_objects)
 
-
-@pytest.mark.asyncio
-async def test_get_completion_without_context(mock_vector_engine):
-    """Test get_completion retrieves context when not provided."""
-    mock_result = MagicMock()
-    mock_result.payload = {"text": "Steve Rodger"}
-    mock_vector_engine.search.return_value = [mock_result]
-
-    retriever = ChunksRetriever()
-
-    with patch(
-        "cognee.modules.retrieval.chunks_retriever.get_vector_engine",
-        return_value=mock_vector_engine,
-    ):
-        completion = await retriever.get_completion("test query")
-
-    assert len(completion) == 1
-    assert completion[0]["text"] == "Steve Rodger"
+    assert context == "Steve Rodger\nMike Broski"
 
 
 @pytest.mark.asyncio
@@ -126,6 +207,8 @@ async def test_init_defaults():
     retriever = ChunksRetriever()
 
     assert retriever.top_k == 5
+    assert retriever.node_name is None
+    assert retriever.node_name_filter_operator == "OR"
 
 
 @pytest.mark.asyncio
@@ -147,37 +230,33 @@ async def test_init_none_top_k():
 @pytest.mark.asyncio
 async def test_get_context_empty_payload(mock_vector_engine):
     """Test get_context handles empty payload."""
-    mock_result = MagicMock()
-    mock_result.payload = {}
-
-    mock_vector_engine.search.return_value = [mock_result]
+    mock_vector_engine.search.return_value = []
 
     retriever = ChunksRetriever()
 
     with patch(
-        "cognee.modules.retrieval.chunks_retriever.get_vector_engine",
-        return_value=mock_vector_engine,
+        "cognee.modules.retrieval.chunks_retriever.get_unified_engine",
+        return_value=_make_unified_mock(mock_vector_engine),
     ):
-        context = await retriever.get_context("test query")
+        retrieved_objects = await retriever.get_retrieved_objects("test query")
+        context = await retriever.get_context_from_objects(
+            "test query", retrieved_objects=retrieved_objects
+        )
 
-    assert len(context) == 1
-    assert context[0] == {}
+    assert context == ""
 
 
 @pytest.mark.asyncio
-async def test_get_completion_with_session_id(mock_vector_engine):
-    """Test get_completion with session_id parameter."""
-    mock_result = MagicMock()
-    mock_result.payload = {"text": "Steve Rodger"}
-    mock_vector_engine.search.return_value = [mock_result]
+async def test_get_completion_from_context_none_payload_still_returns_score():
+    """A ScoredResult with payload=None yields a dict carrying only the score, not a TypeError."""
+    result = MagicMock()
+    result.payload = None
+    result.score = 0.42
 
     retriever = ChunksRetriever()
 
-    with patch(
-        "cognee.modules.retrieval.chunks_retriever.get_vector_engine",
-        return_value=mock_vector_engine,
-    ):
-        completion = await retriever.get_completion("test query", session_id="test_session")
+    completion = await retriever.get_completion_from_context(
+        query="test query", retrieved_objects=[result], context=None
+    )
 
-    assert len(completion) == 1
-    assert completion[0]["text"] == "Steve Rodger"
+    assert completion == [{"score": 0.42}]

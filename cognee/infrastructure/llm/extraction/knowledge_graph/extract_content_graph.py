@@ -1,17 +1,23 @@
 import os
-from typing import Type, Optional
+from typing import Any
+
 from pydantic import BaseModel
 
-from cognee.infrastructure.llm.prompts import render_prompt
-from cognee.infrastructure.llm.LLMGateway import LLMGateway
+from cognee.infrastructure.engine import DataPoint
 from cognee.infrastructure.llm.config import (
     get_llm_config,
+)
+from cognee.infrastructure.llm.LLMGateway import LLMGateway
+from cognee.infrastructure.llm.prompts import render_prompt
+from cognee.shared.llm_graph_model import (
+    content_graph_to_data_point,
+    datapoint_model_to_basemodel,
 )
 
 
 async def extract_content_graph(
-    content: str, response_model: Type[BaseModel], custom_prompt: Optional[str] = None, **kwargs
-):
+    content: str, response_model: type[BaseModel], custom_prompt: str | None = None, **kwargs: Any
+) -> BaseModel:
     if custom_prompt:
         system_prompt = custom_prompt
     else:
@@ -29,8 +35,16 @@ async def extract_content_graph(
 
         system_prompt = render_prompt(prompt_path, {}, base_directory=base_directory)
 
+    simplified_response_model = response_model
+    if isinstance(response_model, type) and issubclass(response_model, DataPoint):
+        simplified_response_model = datapoint_model_to_basemodel(
+            response_model, strip_metadata=True
+        )
+
     content_graph = await LLMGateway.acreate_structured_output(
-        content, system_prompt, response_model, **kwargs
+        content, system_prompt, simplified_response_model, **kwargs
     )
 
+    if isinstance(response_model, type) and issubclass(response_model, DataPoint):
+        return await content_graph_to_data_point(content_graph, response_model)
     return content_graph

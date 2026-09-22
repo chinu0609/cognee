@@ -1,8 +1,10 @@
-from typing import List
-from cognee.infrastructure.loaders.LoaderInterface import LoaderInterface
-from cognee.shared.logging_utils import get_logger
+from typing import Any
+
 from cognee.infrastructure.files.storage import get_file_storage, get_storage_config
 from cognee.infrastructure.files.utils.get_file_metadata import get_file_metadata
+from cognee.infrastructure.loaders.LoaderInterface import LoaderInterface, LoaderResult
+from cognee.infrastructure.loaders.store_derived_text import store_derived_text
+from cognee.shared.logging_utils import get_logger
 
 logger = get_logger(__name__)
 
@@ -15,27 +17,26 @@ class PyPdfLoader(LoaderInterface):
     structured page information and handling PDF-specific errors.
     """
 
+    loader_name = "pypdf_loader"
+
     @property
-    def supported_extensions(self) -> List[str]:
+    def supported_extensions(self) -> list[str]:
         return ["pdf"]
 
     @property
-    def supported_mime_types(self) -> List[str]:
+    def supported_mime_types(self) -> list[str]:
         return ["application/pdf"]
-
-    @property
-    def loader_name(self) -> str:
-        return "pypdf_loader"
 
     def can_handle(self, extension: str, mime_type: str) -> bool:
         """Check if file can be handled by this loader."""
         # Check file extension
-        if extension in self.supported_extensions and mime_type in self.supported_mime_types:
-            return True
+        return bool(
+            extension in self.supported_extensions and mime_type in self.supported_mime_types
+        )
 
-        return False
-
-    async def load(self, file_path: str, strict: bool = False, **kwargs) -> str:
+    async def load(
+        self, file_path: str, strict: bool = False, **kwargs: Any
+    ) -> "str | LoaderResult":
         """
         Load PDF file and extract text content.
 
@@ -77,20 +78,23 @@ class PyPdfLoader(LoaderInterface):
                             page_texts.append(page_text)
                             content_parts.append(f"Page {page_num}:\n{page_text}\n")
                     except Exception as e:
-                        logger.warning(f"Failed to extract text from page {page_num}: {e}")
+                        logger.warning(
+                            f"Failed to extract text from page {page_num}: {e}", exc_info=True
+                        )
                         continue
 
                 # Combine all content
                 full_content = "\n".join(content_parts)
 
+                if not kwargs.get("persist", True):
+                    return full_content
+
                 storage_config = get_storage_config()
                 data_root_directory = storage_config["data_root_directory"]
                 storage = get_file_storage(data_root_directory)
 
-                full_file_path = await storage.store(storage_file_name, full_content)
-
-                return full_file_path
+                return await store_derived_text(storage, storage_file_name, full_content)
 
         except Exception as e:
             logger.error(f"Failed to process PDF {file_path}: {e}")
-            raise Exception(f"PDF processing failed: {e}") from e
+            raise RuntimeError(f"PDF processing failed: {e}") from e

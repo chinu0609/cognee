@@ -1,10 +1,11 @@
-import pytest
-from unittest.mock import AsyncMock, patch, MagicMock
+from unittest.mock import AsyncMock, MagicMock, patch
 
+import pytest
+
+from cognee.modules.graph.cognee_graph.CogneeGraphElements import Edge
 from cognee.modules.retrieval.graph_summary_completion_retriever import (
     GraphSummaryCompletionRetriever,
 )
-from cognee.modules.graph.cognee_graph.CogneeGraphElements import Edge
 
 
 @pytest.fixture
@@ -24,7 +25,6 @@ class TestGraphSummaryCompletionRetriever:
         assert retriever.user_prompt_path == "graph_context_for_question.txt"
         assert retriever.system_prompt_path == "answer_simple_question.txt"
         assert retriever.top_k == 5
-        assert retriever.save_interaction is False
 
     @pytest.mark.asyncio
     async def test_init_custom_params(self):
@@ -35,16 +35,16 @@ class TestGraphSummaryCompletionRetriever:
             summarize_prompt_path="custom_summarize.txt",
             system_prompt="Custom system prompt",
             top_k=10,
-            save_interaction=True,
             wide_search_top_k=200,
             triplet_distance_penalty=2.5,
+            feedback_influence=0.15,
         )
 
         assert retriever.summarize_prompt_path == "custom_summarize.txt"
         assert retriever.user_prompt_path == "custom_user.txt"
         assert retriever.system_prompt_path == "custom_system.txt"
         assert retriever.top_k == 10
-        assert retriever.save_interaction is True
+        assert retriever.feedback_influence == 0.15
 
     @pytest.mark.asyncio
     async def test_resolve_edges_to_text_calls_super_and_summarizes(self, mock_edge):

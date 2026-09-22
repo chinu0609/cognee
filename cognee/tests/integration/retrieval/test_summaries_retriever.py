@@ -1,17 +1,21 @@
+import logging
 import os
-import pytest
 import pathlib
-import pytest_asyncio
-import cognee
 
+import pytest
+import pytest_asyncio
+
+import cognee
+from cognee.infrastructure.databases.vector import get_vector_engine_async
 from cognee.low_level import setup
-from cognee.tasks.storage import add_data_points
-from cognee.infrastructure.databases.vector import get_vector_engine
 from cognee.modules.chunking.models import DocumentChunk
-from cognee.tasks.summarization.models import TextSummary
 from cognee.modules.data.processing.document_types import TextDocument
 from cognee.modules.retrieval.exceptions.exceptions import NoDataError
 from cognee.modules.retrieval.summaries_retriever import SummariesRetriever
+from cognee.tasks.storage import add_data_points
+from cognee.tasks.summarization.models import TextSummary
+
+logger = logging.getLogger(__name__)
 
 
 @pytest_asyncio.fixture
@@ -53,6 +57,8 @@ async def setup_test_environment_with_summaries():
     chunk1_summary = TextSummary(
         text="S.R.",
         made_from=chunk1,
+        source_chunk_id=str(chunk1.id),
+        belongs_to_set=chunk1.belongs_to_set,
     )
     chunk2 = DocumentChunk(
         text="Mike Broski",
@@ -65,6 +71,8 @@ async def setup_test_environment_with_summaries():
     chunk2_summary = TextSummary(
         text="M.B.",
         made_from=chunk2,
+        source_chunk_id=str(chunk2.id),
+        belongs_to_set=chunk2.belongs_to_set,
     )
     chunk3 = DocumentChunk(
         text="Christina Mayer",
@@ -77,6 +85,8 @@ async def setup_test_environment_with_summaries():
     chunk3_summary = TextSummary(
         text="C.M.",
         made_from=chunk3,
+        source_chunk_id=str(chunk3.id),
+        belongs_to_set=chunk3.belongs_to_set,
     )
     chunk4 = DocumentChunk(
         text="Range Rover",
@@ -89,6 +99,8 @@ async def setup_test_environment_with_summaries():
     chunk4_summary = TextSummary(
         text="R.R.",
         made_from=chunk4,
+        source_chunk_id=str(chunk4.id),
+        belongs_to_set=chunk4.belongs_to_set,
     )
     chunk5 = DocumentChunk(
         text="Hyundai",
@@ -101,6 +113,8 @@ async def setup_test_environment_with_summaries():
     chunk5_summary = TextSummary(
         text="H.Y.",
         made_from=chunk5,
+        source_chunk_id=str(chunk5.id),
+        belongs_to_set=chunk5.belongs_to_set,
     )
     chunk6 = DocumentChunk(
         text="Chrysler",
@@ -113,6 +127,8 @@ async def setup_test_environment_with_summaries():
     chunk6_summary = TextSummary(
         text="C.H.",
         made_from=chunk6,
+        source_chunk_id=str(chunk6.id),
+        belongs_to_set=chunk6.belongs_to_set,
     )
 
     entities = [
@@ -132,7 +148,7 @@ async def setup_test_environment_with_summaries():
         await cognee.prune.prune_data()
         await cognee.prune.prune_system(metadata=True)
     except Exception:
-        pass
+        logger.debug("Ignoring exception in setup_test_environment_with_summaries", exc_info=True)
 
 
 @pytest_asyncio.fixture
@@ -154,31 +170,42 @@ async def setup_test_environment_empty():
         await cognee.prune.prune_data()
         await cognee.prune.prune_system(metadata=True)
     except Exception:
-        pass
+        logger.debug("Ignoring exception in setup_test_environment_empty", exc_info=True)
 
 
 @pytest.mark.asyncio
-async def test_summaries_retriever_context(setup_test_environment_with_summaries):
+async def test_summaries_retriever(setup_test_environment_with_summaries):
     """Integration test: verify SummariesRetriever can retrieve summary context."""
     retriever = SummariesRetriever(top_k=20)
+    query = "Christina"
+    summaries = await retriever.get_retrieved_objects(query)
+    context = await retriever.get_context_from_objects(query=query, retrieved_objects=summaries)
 
-    context = await retriever.get_context("Christina")
+    completion = await retriever.get_completion_from_context(
+        query=query, retrieved_objects=summaries, context=context
+    )
 
-    assert isinstance(context, list), "Context should be a list"
-    assert len(context) > 0, "Context should not be empty"
-    assert context[0]["text"] == "C.M.", "Failed to get Christina Mayer"
+    assert isinstance(completion, list), "Context should be a list"
+    assert len(completion) > 0, "Context should not be empty"
+    assert completion[0]["text"] == "C.M.", "Failed to get Christina Mayer"
 
 
 @pytest.mark.asyncio
-async def test_summaries_retriever_context_on_empty_graph(setup_test_environment_empty):
+async def test_summaries_retriever_on_empty_graph(setup_test_environment_empty):
     """Integration test: verify SummariesRetriever handles empty graph correctly."""
     retriever = SummariesRetriever()
+    query = "Christina Mayer"
 
     with pytest.raises(NoDataError):
-        await retriever.get_context("Christina Mayer")
+        await retriever.get_retrieved_objects(query)
 
-    vector_engine = get_vector_engine()
-    await vector_engine.create_collection("TextSummary_text", payload_schema=TextSummary)
+    vector_engine = await get_vector_engine_async()
+    await vector_engine.create_vector_index("TextSummary", "text")
 
-    context = await retriever.get_context("Christina Mayer")
-    assert context == [], "Returned context should be empty on an empty graph"
+    summaries = await retriever.get_retrieved_objects(query)
+    context = await retriever.get_context_from_objects(query=query, retrieved_objects=summaries)
+    completion = await retriever.get_completion_from_context(
+        query=query, retrieved_objects=summaries, context=context
+    )
+
+    assert completion == [], "Returned context should be empty on an empty graph"

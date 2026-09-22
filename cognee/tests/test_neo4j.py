@@ -1,19 +1,28 @@
 import os
 import pathlib
+
 import cognee
 from cognee.infrastructure.files.storage import get_storage_config
+from cognee.modules.engine.models import NodeSet
 from cognee.modules.retrieval.graph_completion_retriever import GraphCompletionRetriever
 from cognee.modules.search.operations import get_history
+from cognee.modules.search.types import SearchType
 from cognee.modules.users.methods import get_default_user
 from cognee.shared.logging_utils import get_logger
-from cognee.modules.search.types import SearchType
-from cognee.modules.engine.models import NodeSet
 
 logger = get_logger()
 
 
 async def main():
-    cognee.config.set_graph_database_provider("neo4j")
+    # The dataset database handler is derived from the provider only when the
+    # provider comes from the environment, so a config dict has to name both.
+    # The URL and credentials still come from GRAPH_DATABASE_* in the environment.
+    cognee.config.set_graph_db_config(
+        {
+            "graph_database_provider": "neo4j",
+            "graph_dataset_database_handler": "neo4j",
+        }
+    )
     data_directory_path = str(
         pathlib.Path(
             os.path.join(pathlib.Path(__file__).parent, ".data_storage/test_neo4j")
@@ -32,6 +41,10 @@ async def main():
 
     dataset_name = "cs_explanations"
 
+    node_set_a = ["NLP"]
+    node_set_b = ["Quantum", "Computers"]
+    node_set_c = ["Quantum"]
+
     explanation_file_path_nlp = os.path.join(
         pathlib.Path(__file__).parent, "test_data/Natural_language_processing.txt"
     )
@@ -43,13 +56,15 @@ async def main():
 
     assert is_empty, "Graph has to be empty"
 
-    await cognee.add([explanation_file_path_nlp], dataset_name)
+    await cognee.add([explanation_file_path_nlp], dataset_name, node_set=node_set_a)
 
     explanation_file_path_quantum = os.path.join(
         pathlib.Path(__file__).parent, "test_data/Quantum_computers.txt"
     )
 
-    await cognee.add([explanation_file_path_quantum], dataset_name)
+    await cognee.add([explanation_file_path_quantum], dataset_name, node_set=node_set_b)
+    await cognee.add("Alice is an expert in Quantum Mechanics", dataset_name, node_set=node_set_c)
+
     is_empty = await graph_engine.is_empty()
 
     assert is_empty, "Graph has to be empty before cognify"
@@ -60,10 +75,12 @@ async def main():
 
     assert not is_empty, "Graph shouldn't be empty"
 
-    from cognee.infrastructure.databases.vector import get_vector_engine
+    from cognee.infrastructure.databases.vector import get_vector_engine_async
 
-    vector_engine = get_vector_engine()
-    random_node = (await vector_engine.search("Entity_name", "Quantum computer"))[0]
+    vector_engine = await get_vector_engine_async()
+    random_node = (
+        await vector_engine.search("Entity_name", "Quantum computer", include_payload=True)
+    )[0]
     random_node_name = random_node.payload["text"]
 
     search_results = await cognee.search(
@@ -109,23 +126,84 @@ async def main():
 
     await cognee.cognify([dataset_name])
 
-    context_nonempty = await GraphCompletionRetriever(
+    graph_retriever = GraphCompletionRetriever(
         node_type=NodeSet,
         node_name=["first"],
-    ).get_context("What is in the context?")
+    )
+    objects = await graph_retriever.get_retrieved_objects("What is in the context?")
+    context_nonempty = await graph_retriever.get_context_from_objects(
+        query="What is in the context?", retrieved_objects=objects
+    )
 
-    context_empty = await GraphCompletionRetriever(
+    graph_retriever = GraphCompletionRetriever(
         node_type=NodeSet,
         node_name=["nonexistent"],
-    ).get_context("What is in the context?")
+    )
+    objects = await graph_retriever.get_retrieved_objects("What is in the context?")
+    context_empty = await graph_retriever.get_context_from_objects(
+        query="What is in the context?", retrieved_objects=objects
+    )
 
-    assert isinstance(context_nonempty, list) and context_nonempty != [], (
+    assert isinstance(context_nonempty, str) and context_nonempty != "", (
         f"Nodeset_search_test:Expected non-empty string for context_nonempty, got: {context_nonempty!r}"
     )
 
-    assert context_empty == [], (
+    assert context_empty == "", (
         f"Nodeset_search_test:Expected empty string for context_empty, got: {context_empty!r}"
     )
+
+    results = await graph_engine.get_nodeset_subgraph(
+        NodeSet, node_set_b, node_name_filter_operator="OR"
+    )
+    nodes = results[0]
+    assert any("alice" in node[1]["name"].lower() for node in nodes if "name" in node[1]), (
+        "Alice is a part of the Quantum nodeset, so it should be included in results"
+    )
+
+    results = await graph_engine.get_nodeset_subgraph(
+        NodeSet, node_set_b, node_name_filter_operator="AND"
+    )
+    nodes = results[0]
+    assert all("Alice" not in node[1]["name"] for node in nodes if "name" in node[1]), (
+        "Alice is ONLY a part of the Quantum nodeset, therefore she should NOT be included in results"
+    )
+
+    query_text = "Tell me about Quantum computers"
+    graph_retriever = GraphCompletionRetriever(
+        node_type=NodeSet, node_name=node_set_b, node_name_filter_operator="OR", top_k=250
+    )
+    objects = await graph_retriever.get_retrieved_objects(query_text)
+    context = await graph_retriever.get_context_from_objects(
+        query=query_text, retrieved_objects=objects
+    )
+
+    assert "Alice" in context
+
+    graph_retriever = GraphCompletionRetriever(
+        node_type=NodeSet, node_name=node_set_b, node_name_filter_operator="AND", top_k=250
+    )
+    objects = await graph_retriever.get_retrieved_objects(query_text)
+    context = await graph_retriever.get_context_from_objects(
+        query=query_text, retrieved_objects=objects
+    )
+
+    assert "Alice" not in context
+
+    # remember() / recall() reach this store the way an SDK caller does;
+    # everything above drives add() / cognify() / search() instead. Kept after
+    # the search-history assert, since recall() adds to that history too.
+    remember_dataset = "store_remember_check"
+    await cognee.remember(
+        ["Cognee keeps entities in the graph store and embeddings in the vector store."],
+        dataset_name=remember_dataset,
+        self_improvement=False,
+    )
+    recall_results = await cognee.recall(
+        query_text="Where does cognee keep entities?",
+        query_type=SearchType.CHUNKS,
+        datasets=[remember_dataset],
+    )
+    assert recall_results, "recall() returned nothing after remember() on Neo4j"
 
     await cognee.prune.prune_data()
     data_root_directory = get_storage_config()["data_root_directory"]

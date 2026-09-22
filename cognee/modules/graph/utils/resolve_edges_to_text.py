@@ -1,13 +1,15 @@
 import string
-from typing import List
 from collections import Counter
 
 from cognee.modules.graph.cognee_graph.CogneeGraphElements import Edge
 from cognee.modules.retrieval.utils.stop_words import DEFAULT_STOP_WORDS
+from cognee.shared.logging_utils import get_logger
+
+logger = get_logger()
 
 
 def _get_top_n_frequent_words(
-    text: str, stop_words: set = None, top_n: int = 3, separator: str = ", "
+    text: str, stop_words: set | None = None, top_n: int = 3, separator: str = ", "
 ) -> str:
     """Concatenates the top N frequent words in text."""
     if stop_words is None:
@@ -27,8 +29,14 @@ def _create_title_from_text(text: str, first_n_words: int = 7, top_n_words: int 
     return f"{' '.join(first_words)}... [{top_words}]"
 
 
-def _extract_nodes_from_edges(retrieved_edges: List[Edge]) -> dict:
+def _extract_nodes_from_edges(retrieved_edges: list[Edge]) -> dict:
     """Creates a dictionary of nodes with their names and content."""
+
+    logger.debug(
+        "Extracting nodes from retrieved edges",
+        extra={"edge_count": len(retrieved_edges)},
+    )
+
     nodes = {}
 
     for edge in retrieved_edges:
@@ -49,8 +57,11 @@ def _extract_nodes_from_edges(retrieved_edges: List[Edge]) -> dict:
     return nodes
 
 
-async def resolve_edges_to_text(retrieved_edges: List[Edge]) -> str:
+async def resolve_edges_to_text(retrieved_edges: list[Edge]) -> str:
     """Converts retrieved graph edges into a human-readable string format."""
+    if not retrieved_edges:
+        return ""
+
     nodes = _extract_nodes_from_edges(retrieved_edges)
 
     node_section = "\n".join(
@@ -59,12 +70,37 @@ async def resolve_edges_to_text(retrieved_edges: List[Edge]) -> str:
     )
 
     connections = []
+
+    logger.debug(
+        "Resolving edges to text",
+        extra={"edge_count": len(retrieved_edges)},
+    )
+
     for edge in retrieved_edges:
         source_name = nodes[edge.node1.id]["name"]
         target_name = nodes[edge.node2.id]["name"]
-        edge_label = edge.attributes.get("edge_text") or edge.attributes.get("relationship_type")
-        connections.append(f"{source_name} --[{edge_label}]--> {target_name}")
+        edge_label = (
+            edge.attributes.get("relationship_type")
+            or edge.attributes.get("relationship_name")
+            or edge.attributes.get("edge_text")
+        )
+
+        line = f"{source_name} --[{edge_label}]--> {target_name}"
+
+        description = edge.attributes.get("edge_text")
+        if description and description != edge_label:
+            line += f"  ({description})"
+
+        connections.append(line)
 
     connection_section = "\n".join(connections)
+
+    logger.info(
+        "Completed resolving edges to text",
+        extra={
+            "node_count": len(nodes),
+            "connection_count": len(connections),
+        },
+    )
 
     return f"Nodes:\n{node_section}\n\nConnections:\n{connection_section}"

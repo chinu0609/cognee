@@ -1,5 +1,4 @@
 from abc import ABC, abstractmethod
-from typing import List
 
 from cognee.infrastructure.engine import DataPoint
 
@@ -14,7 +13,7 @@ class BaseContextProvider(ABC):
     """
 
     @abstractmethod
-    async def get_context(self, entities: List[DataPoint], query: str) -> str:
+    async def get_context(self, entities: list[DataPoint], query: str) -> str:
         """
         Get relevant context based on extracted entities and original query.
 
@@ -30,4 +29,3 @@ class BaseContextProvider(ABC):
             - query (str): The original query string used to extract the entities and retrieve
               context.
         """
-        pass

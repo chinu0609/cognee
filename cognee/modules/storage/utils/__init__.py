@@ -1,9 +1,10 @@
 import json
+import copy
 from uuid import UUID
 from decimal import Decimal
-from datetime import datetime
+from datetime import date, datetime
 from pydantic_core import PydanticUndefined
-from pydantic import create_model, ConfigDict, BaseModel
+from pydantic import create_model, ConfigDict, BaseModel, Field
 
 from cognee.infrastructure.engine import DataPoint
 
@@ -12,6 +13,8 @@ class JSONEncoder(json.JSONEncoder):
     def default(self, obj):
         if isinstance(obj, datetime):
             return obj.isoformat()  # Convert datetime to ISO 8601 string
+        elif isinstance(obj, date):
+            return obj.isoformat()
         elif isinstance(obj, UUID):
             # if the obj is uuid, we simply return the value of uuid
             return str(obj)
@@ -20,12 +23,26 @@ class JSONEncoder(json.JSONEncoder):
         return json.JSONEncoder.default(self, obj)
 
 
-def copy_model(model: DataPoint, include_fields: dict = {}, exclude_fields: list = []):
-    fields = {
-        name: (field.annotation, field.default if field.default is not None else PydanticUndefined)
-        for name, field in model.model_fields.items()
-        if name not in exclude_fields
-    }
+def copy_model(
+    model: DataPoint, include_fields: dict | None = None, exclude_fields: list | None = None
+):
+    if include_fields is None:
+        include_fields = {}
+    if exclude_fields is None:
+        exclude_fields = []
+    fields = {}
+    for name, field in model.model_fields.items():
+        if name in exclude_fields:
+            continue
+
+        if hasattr(field, "is_required") and field.is_required():
+            fields[name] = (field.annotation, PydanticUndefined)
+        elif field.default_factory is not None:
+            fields[name] = (field.annotation, Field(default_factory=field.default_factory))
+        else:
+            # Preserve explicit None defaults (and other scalar/container defaults)
+            # so optional fields remain optional in copied models.
+            fields[name] = (field.annotation, copy.deepcopy(field.default))
 
     final_fields = {**fields, **include_fields}
 
@@ -46,9 +63,12 @@ def get_own_properties(data_point: DataPoint):
     for field_name, field_value in data_point:
         if (
             field_name == "metadata"
-            or isinstance(field_value, dict)
-            or isinstance(field_value, DataPoint)
-            or (isinstance(field_value, list) and isinstance(field_value[0], DataPoint))
+            or isinstance(field_value, (dict, DataPoint))
+            or (
+                isinstance(field_value, list)
+                and len(field_value) > 0
+                and isinstance(field_value[0], DataPoint)
+            )
         ):
             continue
 

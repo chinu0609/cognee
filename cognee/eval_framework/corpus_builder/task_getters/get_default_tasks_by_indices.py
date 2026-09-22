@@ -1,16 +1,15 @@
-from typing import List
 from cognee.api.v1.cognify.cognify import get_default_tasks
-from cognee.modules.pipelines.tasks.task import Task
 from cognee.modules.chunking.TextChunker import TextChunker
+from cognee.modules.ontology.rdf_xml.RDFLibOntologyResolver import RDFLibOntologyResolver
+from cognee.modules.pipelines.tasks.task import Task
+from cognee.shared.data_models import KnowledgeGraph
 from cognee.tasks.graph import extract_graph_from_data
 from cognee.tasks.storage import add_data_points
-from cognee.shared.data_models import KnowledgeGraph
-from cognee.modules.ontology.rdf_xml.RDFLibOntologyResolver import RDFLibOntologyResolver
 
 
 async def get_default_tasks_by_indices(
-    indices: List[int], chunk_size: int = None, chunker=TextChunker
-) -> List[Task]:
+    indices: list[int], chunk_size: int | None = None, chunker=TextChunker
+) -> list[Task]:
     """Returns default tasks filtered by the provided indices."""
     all_tasks = await get_default_tasks(chunker=chunker, chunk_size=chunk_size)
 
@@ -23,24 +22,25 @@ async def get_default_tasks_by_indices(
 
 
 async def get_no_summary_tasks(
-    chunk_size: int = None,
+    chunk_size: int | None = None,
     chunker=TextChunker,
     user=None,
     graph_model=KnowledgeGraph,
     ontology_file_path=None,
-) -> List[Task]:
+) -> list[Task]:
     """Returns default tasks without summarization tasks."""
     # Get base tasks (0=classify, 1=extract_chunks)
     base_tasks = await get_default_tasks_by_indices([0, 1], chunk_size, chunker)
 
-    ontology_adapter = RDFLibOntologyResolver(ontology_file=ontology_file_path)
+    graph_task_kwargs = {
+        "graph_model": graph_model,
+        "task_config": {"batch_size": 10},
+    }
+    if ontology_file_path is not None:
+        ontology_resolver = RDFLibOntologyResolver(ontology_file=ontology_file_path)
+        graph_task_kwargs["config"] = {"ontology_config": {"ontology_resolver": ontology_resolver}}
 
-    graph_task = Task(
-        extract_graph_from_data,
-        graph_model=graph_model,
-        ontology_adapter=ontology_adapter,
-        task_config={"batch_size": 10},
-    )
+    graph_task = Task(extract_graph_from_data, **graph_task_kwargs)
 
     add_data_points_task = Task(add_data_points, task_config={"batch_size": 10})
 
@@ -48,8 +48,8 @@ async def get_no_summary_tasks(
 
 
 async def get_just_chunks_tasks(
-    chunk_size: int = None, chunker=TextChunker, user=None
-) -> List[Task]:
+    chunk_size: int | None = None, chunker=TextChunker, user=None
+) -> list[Task]:
     """Returns default tasks with only chunk extraction and data points addition."""
     # Get base tasks (0=classify, 1=extract_chunks)
     base_tasks = await get_default_tasks_by_indices([0, 1], chunk_size, chunker)

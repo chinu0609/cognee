@@ -5,10 +5,13 @@ from web pages using BeautifulSoup or Playwright for JavaScript-rendered pages. 
 supports robots.txt handling, rate limiting, and custom extraction rules.
 """
 
-from typing import Union, Dict, Any, Optional, List
 from dataclasses import dataclass
+from typing import Any
+
 from bs4 import BeautifulSoup
-from cognee.infrastructure.loaders.LoaderInterface import LoaderInterface
+
+from cognee.infrastructure.loaders.LoaderInterface import LoaderInterface, LoaderResult
+from cognee.infrastructure.loaders.store_derived_text import store_derived_text
 from cognee.shared.logging_utils import get_logger
 
 logger = get_logger(__name__)
@@ -26,9 +29,9 @@ class ExtractionRule:
         join_with: String to join multiple extracted elements.
     """
 
-    selector: Optional[str] = None
-    xpath: Optional[str] = None
-    attr: Optional[str] = None
+    selector: str | None = None
+    xpath: str | None = None
+    attr: str | None = None
     all: bool = False
     join_with: str = " "
 
@@ -50,23 +53,21 @@ class BeautifulSoupLoader(LoaderInterface):
         robots_cache_ttl: Time-to-live for robots.txt cache in seconds.
     """
 
+    loader_name = "beautiful_soup_loader"
+
     @property
-    def supported_extensions(self) -> List[str]:
+    def supported_extensions(self) -> list[str]:
         return ["html"]
 
     @property
-    def supported_mime_types(self) -> List[str]:
+    def supported_mime_types(self) -> list[str]:
         return ["text/html", "text/plain"]
-
-    @property
-    def loader_name(self) -> str:
-        return "beautiful_soup_loader"
 
     def can_handle(self, extension: str, mime_type: str) -> bool:
         can = extension in self.supported_extensions and mime_type in self.supported_mime_types
         return can
 
-    def _get_default_extraction_rules(self):
+    def _get_default_extraction_rules(self) -> dict[str, Any]:
         # Comprehensive default extraction rules for common HTML content
         return {
             # Meta information
@@ -153,10 +154,10 @@ class BeautifulSoupLoader(LoaderInterface):
     async def load(
         self,
         file_path: str,
-        extraction_rules: dict[str, Any] = None,
+        extraction_rules: dict[str, Any] | None = None,
         join_all_matches: bool = False,
-        **kwargs,
-    ):
+        **kwargs: Any,
+    ) -> "str | LoaderResult":
         """Load an HTML file, extract content, and save to storage.
 
         Args:
@@ -174,8 +175,8 @@ class BeautifulSoupLoader(LoaderInterface):
 
         logger.info(f"Processing HTML file: {file_path}")
 
-        from cognee.infrastructure.files.utils.get_file_metadata import get_file_metadata
         from cognee.infrastructure.files.storage import get_file_storage, get_storage_config
+        from cognee.infrastructure.files.utils.get_file_metadata import get_file_metadata
 
         with open(file_path, "rb") as f:
             file_metadata = await get_file_metadata(f)
@@ -185,26 +186,27 @@ class BeautifulSoupLoader(LoaderInterface):
         storage_file_name = "text_" + file_metadata["content_hash"] + ".txt"
 
         # Normalize extraction rules
-        normalized_rules: List[ExtractionRule] = []
-        for _, rule in extraction_rules.items():
+        normalized_rules: list[ExtractionRule] = []
+        for rule in extraction_rules.values():
             r = self._normalize_rule(rule)
             if join_all_matches:
                 r.all = True
             normalized_rules.append(r)
 
+        soup = BeautifulSoup(html, "html.parser")
         pieces = []
+        extracted_elements: set[int] = set()
         for rule in normalized_rules:
-            text = self._extract_from_html(html, rule)
+            text, new_elements = self._extract_from_html(soup, rule, extracted_elements, html)
             if text:
                 pieces.append(text)
+                extracted_elements.update(id(el) for el in new_elements if el is not None)
 
         full_content = " ".join(pieces).strip()
 
         # remove after defaults for extraction rules
         # Fallback: If no content extracted, check if the file is plain text (not HTML)
         if not full_content:
-            from bs4 import BeautifulSoup
-
             soup = BeautifulSoup(html, "html.parser")
             # If there are no HTML tags, treat as plain text
             if not soup.find():
@@ -218,17 +220,18 @@ class BeautifulSoupLoader(LoaderInterface):
         if not full_content:
             logger.warning(f"No content extracted from HTML file: {file_path}")
 
+        if not kwargs.get("persist", True):
+            return full_content
+
         # Store the extracted content
         storage_config = get_storage_config()
         data_root_directory = storage_config["data_root_directory"]
         storage = get_file_storage(data_root_directory)
 
-        full_file_path = await storage.store(storage_file_name, full_content)
-
         logger.info(f"Extracted {len(full_content)} characters from HTML")
-        return full_file_path
+        return await store_derived_text(storage, storage_file_name, full_content)
 
-    def _normalize_rule(self, rule: Union[str, Dict[str, Any]]) -> ExtractionRule:
+    def _normalize_rule(self, rule: str | dict[str, Any]) -> ExtractionRule:
         """Normalize an extraction rule to an ExtractionRule dataclass.
 
         Args:
@@ -252,28 +255,39 @@ class BeautifulSoupLoader(LoaderInterface):
             )
         raise ValueError(f"Invalid extraction rule: {rule}")
 
-    def _extract_from_html(self, html: str, rule: ExtractionRule) -> str:
-        """Extract content from HTML using BeautifulSoup or lxml XPath.
+    def _extract_from_html(
+        self,
+        soup: BeautifulSoup,
+        rule: ExtractionRule,
+        extracted_elements: set[int] | None = None,
+        html: bytes | None = None,
+    ) -> tuple[str, list[Any]]:
+        """Extract content from a BeautifulSoup parsed document.
 
         Args:
-            html: The HTML content to extract from.
+            soup: BeautifulSoup parsed document.
             rule: The extraction rule to apply.
+            extracted_elements: Set of element ids already extracted by broader rules.
+                Elements that are descendants of these will be skipped.
+            html: Raw bytes needed for XPath extraction (lxml parses from bytes).
 
         Returns:
-            str: The extracted content.
+            tuple[str, list[Any]]: The extracted content and the list of elements extracted.
 
         Raises:
             RuntimeError: If XPath is used but lxml is not installed.
         """
-        soup = BeautifulSoup(html, "html.parser")
+        extracted_elements = extracted_elements or set()
 
         if rule.xpath:
             try:
-                from lxml import html as lxml_html
+                from lxml import html as lxml_html  # ty:ignore[unresolved-import]
             except ImportError:
                 raise RuntimeError(
                     "XPath requested but lxml is not available. Install lxml or use CSS selectors."
                 )
+            if html is None:
+                return "", []
             doc = lxml_html.fromstring(html)
             nodes = doc.xpath(rule.xpath)
             texts = []
@@ -282,29 +296,36 @@ class BeautifulSoupLoader(LoaderInterface):
                     texts.append(n.text_content().strip())
                 else:
                     texts.append(str(n).strip())
-            return rule.join_with.join(t for t in texts if t)
+            return rule.join_with.join(t for t in texts if t), []
 
         if not rule.selector:
-            return ""
+            return "", []
 
         if rule.all:
             nodes = soup.select(rule.selector)
             pieces = []
+            used_nodes = []
             for el in nodes:
+                if any(ancestor in extracted_elements for ancestor in (id(p) for p in el.parents)):
+                    continue
                 if rule.attr:
                     val = el.get(rule.attr)
                     if val:
-                        pieces.append(val.strip())
+                        pieces.append(val.strip())  # ty:ignore[unresolved-attribute]
+                        used_nodes.append(el)
                 else:
                     text = el.get_text(strip=True)
                     if text:
                         pieces.append(text)
-            return rule.join_with.join(pieces).strip()
+                        used_nodes.append(el)
+            return rule.join_with.join(pieces).strip(), used_nodes
         else:
             el = soup.select_one(rule.selector)
             if el is None:
-                return ""
+                return "", []
+            if any(ancestor in extracted_elements for ancestor in (id(p) for p in el.parents)):
+                return "", []
             if rule.attr:
                 val = el.get(rule.attr)
-                return (val or "").strip()
-            return el.get_text(strip=True)
+                return (val or "").strip(), [el]  # ty:ignore[unresolved-attribute]
+            return el.get_text(strip=True), [el]

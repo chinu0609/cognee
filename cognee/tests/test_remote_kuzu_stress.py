@@ -1,8 +1,11 @@
 import asyncio
 import random
 import time
-from cognee.infrastructure.databases.graph.kuzu.remote_kuzu_adapter import RemoteKuzuAdapter
+
 from cognee.infrastructure.databases.graph.config import get_graph_config
+from cognee.infrastructure.databases.graph.ladybug.remote_ladybug_adapter import (
+    RemoteLadybugAdapter,
+)
 from cognee.shared.logging_utils import get_logger
 
 # Test configuration
@@ -90,12 +93,12 @@ async def create_test_data(adapter, batch_size=BATCH_SIZE):
 
 async def main():
     config = get_graph_config()
-    adapter = RemoteKuzuAdapter(
+    adapter = RemoteLadybugAdapter(
         config.graph_database_url, config.graph_database_username, config.graph_database_password
     )
 
     try:
-        logger.info("=== Starting Kuzu Stress Test ===")
+        logger.info("=== Starting Ladybug Stress Test ===")
         logger.info(f"Configuration: {NUM_BATCHES} batches of {BATCH_SIZE} nodes each")
         logger.info(f"Total nodes to create: {TOTAL_NODES}")
         logger.info(f"Total relationships to create: {TOTAL_RELATIONSHIPS}")

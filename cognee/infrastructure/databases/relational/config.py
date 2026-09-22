@@ -1,8 +1,8 @@
-import os
 import json
-import pydantic
-from typing import Union
+import os
 from functools import lru_cache
+
+import pydantic
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 from cognee.base_config import get_base_config
@@ -15,12 +15,19 @@ class RelationalConfig(BaseSettings):
 
     db_path: str = ""
     db_name: str = "cognee_db"
-    db_host: Union[str, None] = None  # "localhost"
-    db_port: Union[str, None] = None  # "5432"
-    db_username: Union[str, None] = None  # "cognee"
-    db_password: Union[str, None] = None  # "cognee"
+    db_host: str | None = None  # "localhost"
+    db_port: str | None = None  # "5432"
+    db_username: str | None = None  # "cognee"
+    db_password: str | None = None  # "cognee"
     db_provider: str = "sqlite"
-    database_connect_args: Union[str, None] = None
+    database_connect_args: str | None = None
+    pool_args: str | None = None
+    # Turso (libSQL) specific settings. Only used when db_provider == "turso".
+    # db_turso_url: remote Turso database URL (e.g. "libsql://<db>.turso.io").
+    #   Leave unset for a purely local/embedded libSQL file (uses db_path/db_name).
+    # db_turso_auth_token: auth token for the remote Turso database.
+    db_turso_url: str | None = None
+    db_turso_auth_token: str | None = None
 
     model_config = SettingsConfigDict(env_file=".env", extra="allow")
 
@@ -34,14 +41,25 @@ class RelationalConfig(BaseSettings):
 
         # Parse database_connect_args if provided as JSON string
         if self.database_connect_args and isinstance(self.database_connect_args, str):
-            try:
-                parsed_args = json.loads(self.database_connect_args)
-                if isinstance(parsed_args, dict):
-                    self.database_connect_args = parsed_args
-                else:
-                    self.database_connect_args = {}
-            except json.JSONDecodeError:
-                self.database_connect_args = {}
+            parsed_args = json.loads(self.database_connect_args)
+            if isinstance(parsed_args, dict):
+                # Note: For caching purposes, database_connect_args is stored as a sorted tuple of key-value pairs in the config
+                #       It is later returned to a dictionary format
+                self.database_connect_args = tuple(sorted(parsed_args.items()))
+            else:
+                raise ValueError(
+                    "DATABASE_CONNECT_ARGS must be a JSON string representing a dictionary"
+                )
+
+        # Parse pool_args if provided as JSON string
+        if self.pool_args and isinstance(self.pool_args, str):
+            parsed_args = json.loads(self.pool_args)
+            if isinstance(parsed_args, dict):
+                # Note: For caching purposes, pool_args is stored as a sorted tuple of key-value pairs in the config
+                #       It is later returned to a dictionary format
+                self.pool_args = tuple(sorted(parsed_args.items()))
+            else:
+                raise ValueError("POOL_ARGS must be a JSON string representing a dictionary")
 
         return self
 
@@ -65,11 +83,14 @@ class RelationalConfig(BaseSettings):
             "db_password": self.db_password,
             "db_provider": self.db_provider,
             "database_connect_args": self.database_connect_args,
+            "pool_args": self.pool_args,
+            "db_turso_url": self.db_turso_url,
+            "db_turso_auth_token": self.db_turso_auth_token,
         }
 
 
 @lru_cache
-def get_relational_config():
+def get_relational_config() -> RelationalConfig:
     """
     Cache and return the relational database configuration.
 
@@ -103,13 +124,13 @@ class MigrationConfig(BaseSettings):
     - migration_db_provider: Provider type for the migration database.
     """
 
-    migration_db_path: Union[str, None] = None
-    migration_db_name: Union[str, None] = None
-    migration_db_host: Union[str, None] = None
-    migration_db_port: Union[str, None] = None
-    migration_db_username: Union[str, None] = None
-    migration_db_password: Union[str, None] = None
-    migration_db_provider: Union[str, None] = None
+    migration_db_path: str | None = None
+    migration_db_name: str | None = None
+    migration_db_host: str | None = None
+    migration_db_port: str | None = None
+    migration_db_username: str | None = None
+    migration_db_password: str | None = None
+    migration_db_provider: str | None = None
 
     model_config = SettingsConfigDict(env_file=".env", extra="allow")
 

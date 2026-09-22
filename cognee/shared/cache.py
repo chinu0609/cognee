@@ -5,13 +5,13 @@ This module provides cache functionality that works with both local and cloud st
 backends (like S3) through the StorageManager abstraction.
 """
 
-import hashlib
-import zipfile
 import asyncio
-from typing import Optional, Tuple
-import aiohttp
+import hashlib
 import logging
+import zipfile
 from io import BytesIO
+
+import aiohttp
 
 from cognee.base_config import get_base_config
 from cognee.infrastructure.files.storage.get_file_storage import get_file_storage
@@ -26,7 +26,7 @@ class StorageAwareCache:
     A cache manager that works with different storage backends (local, S3, etc.)
     """
 
-    def __init__(self, cache_subdir: str = "cache"):
+    def __init__(self, cache_subdir: str = "cache") -> None:
         """
         Initialize the cache manager.
 
@@ -73,7 +73,7 @@ class StorageAwareCache:
             # Fallback for other storage types
             return cache_path
 
-    async def delete_cache(self):
+    async def delete_cache(self) -> None:
         """Delete the entire cache directory."""
         logger.info("Deleting cache...")
         try:
@@ -95,7 +95,7 @@ class StorageAwareCache:
                 cached_version = (await asyncio.to_thread(f.read)).strip()
                 return cached_version == version_or_hash
         except Exception as e:
-            logger.debug(f"Error checking cache validity: {e}")
+            logger.debug(f"Error checking cache validity: {e}", exc_info=True)
             return False
 
     async def _clear_cache(self, cache_dir: str) -> None:
@@ -103,11 +103,11 @@ class StorageAwareCache:
         try:
             await self.storage_manager.remove_all(cache_dir)
         except Exception as e:
-            logger.debug(f"Error clearing cache directory {cache_dir}: {e}")
+            logger.debug(f"Error clearing cache directory {cache_dir}: {e}", exc_info=True)
 
     async def _check_remote_content_freshness(
         self, url: str, cache_dir: str
-    ) -> Tuple[bool, Optional[str]]:
+    ) -> tuple[bool, str | None]:
         """
         Check if remote content is fresher than cached version using HTTP headers.
 
@@ -118,13 +118,15 @@ class StorageAwareCache:
             # Make a HEAD request to check headers without downloading
             ssl_context = create_secure_ssl_context()
             connector = aiohttp.TCPConnector(ssl=ssl_context)
-            async with aiohttp.ClientSession(connector=connector) as session:
-                async with session.head(url, timeout=aiohttp.ClientTimeout(total=30)) as response:
-                    response.raise_for_status()
+            async with (
+                aiohttp.ClientSession(connector=connector) as session,
+                session.head(url, timeout=aiohttp.ClientTimeout(total=30)) as response,
+            ):
+                response.raise_for_status()
 
-                    # Try ETag first (most reliable)
-                    etag = response.headers.get("ETag", "").strip('"')
-                    last_modified = response.headers.get("Last-Modified", "")
+                # Try ETag first (most reliable)
+                etag = response.headers.get("ETag", "").strip('"')
+                last_modified = response.headers.get("Last-Modified", "")
 
             # Use ETag if available, otherwise Last-Modified
             remote_identifier = etag if etag else last_modified
@@ -151,7 +153,7 @@ class StorageAwareCache:
                 return False, remote_identifier
 
         except Exception as e:
-            logger.debug(f"Could not check remote freshness: {e}")
+            logger.debug(f"Could not check remote freshness: {e}", exc_info=True)
             return True, None  # Assume fresh if we can't check
 
     async def download_and_extract_zip(
@@ -174,7 +176,7 @@ class StorageAwareCache:
         # Check if already cached and valid
         if not force and await self._is_cache_valid(cache_dir, version_or_hash):
             # Also check if remote content has changed
-            is_fresh, new_identifier = await self._check_remote_content_freshness(url, cache_dir)
+            is_fresh, _new_identifier = await self._check_remote_content_freshness(url, cache_dir)
             if is_fresh:
                 logger.debug(f"Content already cached and fresh for version {version_or_hash}")
                 return cache_dir
@@ -192,17 +194,19 @@ class StorageAwareCache:
         last_modified = ""
         ssl_context = create_secure_ssl_context()
         connector = aiohttp.TCPConnector(ssl=ssl_context)
-        async with aiohttp.ClientSession(connector=connector) as session:
-            async with session.get(url, timeout=aiohttp.ClientTimeout(total=60)) as response:
-                response.raise_for_status()
+        async with (
+            aiohttp.ClientSession(connector=connector) as session,
+            session.get(url, timeout=aiohttp.ClientTimeout(total=60)) as response,
+        ):
+            response.raise_for_status()
 
-                # Extract headers before consuming response
-                etag = response.headers.get("ETag", "").strip('"')
-                last_modified = response.headers.get("Last-Modified", "")
+            # Extract headers before consuming response
+            etag = response.headers.get("ETag", "").strip('"')
+            last_modified = response.headers.get("Last-Modified", "")
 
-                # Read the response content
-                async for chunk in response.content.iter_chunked(8192):
-                    zip_content.write(chunk)
+            # Read the response content
+            async for chunk in response.content.iter_chunked(8192):
+                zip_content.write(chunk)
         zip_content.seek(0)
 
         # Extract the archive
@@ -244,7 +248,7 @@ class StorageAwareCache:
         """Read a file from cache storage."""
         return self.storage_manager.open(file_path, encoding=encoding)
 
-    async def list_files(self, directory_path: str):
+    async def list_files(self, directory_path: str) -> list[str]:
         """List files in a cache directory."""
         try:
             file_list = await self.storage_manager.list_files(directory_path)
@@ -273,7 +277,7 @@ class StorageAwareCache:
                 return full_paths
 
         except Exception as e:
-            logger.debug(f"Error listing files in {directory_path}: {e}")
+            logger.debug(f"Error listing files in {directory_path}: {e}", exc_info=True)
             return []
 
 
@@ -296,7 +300,7 @@ def generate_content_hash(url: str, additional_data: str = "") -> str:
 
 
 # Async wrapper functions for backward compatibility
-async def delete_cache():
+async def delete_cache() -> None:
     """Delete the Cognee cache directory."""
     cache_manager = get_cache_manager()
     await cache_manager.delete_cache()
@@ -340,7 +344,7 @@ async def read_cache_file(file_path: str, encoding: str = "utf-8"):
     return await cache_manager.read_file(file_path, encoding)
 
 
-async def list_cache_files(directory_path: str):
+async def list_cache_files(directory_path: str) -> list[str]:
     """List files in a cache directory."""
     cache_manager = get_cache_manager()
     return await cache_manager.list_files(directory_path)

@@ -2,19 +2,22 @@ import os
 import pathlib
 
 import cognee
-from cognee.shared.logging_utils import get_logger
+from cognee import visualize_graph
 from cognee.infrastructure.files.storage import get_storage_config
 from cognee.modules.data.models import Data
-from cognee.modules.users.methods import get_default_user
-from cognee.modules.search.types import SearchType
 from cognee.modules.search.operations import get_history
+from cognee.modules.search.types import SearchType
+from cognee.modules.users.methods import get_default_user
+from cognee.shared.logging_utils import get_logger
 
 logger = get_logger()
 
 
 async def test_local_file_deletion(data_text, file_location):
-    from sqlalchemy import select
     import hashlib
+
+    from sqlalchemy import select
+
     from cognee.infrastructure.databases.relational import get_relational_engine
 
     engine = get_relational_engine()
@@ -49,12 +52,12 @@ async def test_local_file_deletion(data_text, file_location):
         )
 
 
-async def test_getting_of_documents(dataset_name_1):
+async def test_getting_of_documents(dataset_id_1):
     # Test getting of documents for search per dataset
     from cognee.modules.users.permissions.methods import get_document_ids_for_user
 
     user = await get_default_user()
-    document_ids = await get_document_ids_for_user(user.id, [dataset_name_1])
+    document_ids = await get_document_ids_for_user(user.id, [dataset_id_1])
     assert len(document_ids) == 1, (
         f"Number of expected documents doesn't match {len(document_ids)} != 1"
     )
@@ -68,30 +71,11 @@ async def test_getting_of_documents(dataset_name_1):
 
 
 async def test_vector_engine_search_none_limit():
-    file_path_quantum = os.path.join(
-        pathlib.Path(__file__).parent, "test_data/Quantum_computers.txt"
-    )
-
-    file_path_nlp = os.path.join(
-        pathlib.Path(__file__).parent,
-        "test_data/Natural_language_processing.txt",
-    )
-
-    await cognee.prune.prune_data()
-    await cognee.prune.prune_system(metadata=True)
-
-    await cognee.add(file_path_quantum)
-
-    await cognee.add(file_path_nlp)
-
-    await cognee.cognify()
-
     query_text = "Tell me about Quantum computers"
 
-    from cognee.infrastructure.databases.vector import get_vector_engine
+    from cognee.infrastructure.databases.vector import get_vector_engine_async
 
-    vector_engine = get_vector_engine()
-
+    vector_engine = await get_vector_engine_async()
     collection_name = "Entity_name"
 
     query_vector = (await vector_engine.embedding_engine.embed_text([query_text]))[0]
@@ -103,6 +87,127 @@ async def test_vector_engine_search_none_limit():
     # Check that we did not accidentally use any default value for limit
     # in vector search along the way (like 5, 10, or 15)
     assert len(result) > 15
+
+
+async def test_vector_engine_search_with_nodeset_filtering():
+    node_set_a = ["NLP"]
+    node_set_b = ["Quantum", "Computers"]
+    node_set_c = ["Quantum"]
+
+    explanation_file_path_nlp = os.path.join(
+        pathlib.Path(__file__).parent, "test_data/Natural_language_processing.txt"
+    )
+    await cognee.add([explanation_file_path_nlp], node_set=node_set_a)
+
+    explanation_file_path_quantum = os.path.join(
+        pathlib.Path(__file__).parent, "test_data/Quantum_computers.txt"
+    )
+
+    await cognee.add([explanation_file_path_quantum], node_set=node_set_b)
+
+    await cognee.add("Alice is an expert in Quantum Mechanics", node_set=node_set_c)
+
+    await cognee.cognify()
+
+    node_set = ["NLP", "Quantum"]
+    query_text = "Tell me about NLP"
+
+    from cognee.infrastructure.databases.vector import get_vector_engine_async
+
+    vector_engine = await get_vector_engine_async()
+    query_vector = (await vector_engine.embedding_engine.embed_text([query_text]))[0]
+
+    # Search with "OR" operator
+    result = await vector_engine.search(
+        collection_name="DocumentChunk_text",
+        query_vector=query_vector,
+        include_payload=True,
+        limit=None,
+        node_name=node_set,
+        node_name_filter_operator="OR",
+    )
+
+    assert all(nodeset in node_set for nodeset in result[0].payload["belongs_to_set"]), (
+        "Only results from relevant nodesets should be returned"
+    )
+
+    # Search with "AND" operator
+    result = await vector_engine.search(
+        collection_name="DocumentChunk_text",
+        query_vector=query_vector,
+        include_payload=True,
+        limit=None,
+        node_name=node_set,
+        node_name_filter_operator="AND",
+    )
+
+    assert len(result) == 0, f"Results for search with all nodesets in {node_set} should be empty"
+
+    node_set = ["Quantum", "Computers"]
+
+    # Search with "OR" operator
+    result = await vector_engine.search(
+        collection_name="Entity_name",
+        query_vector=query_vector,
+        include_payload=True,
+        limit=None,
+        node_name=node_set,
+        node_name_filter_operator="OR",
+    )
+
+    assert any(entity.payload["text"].lower() == "alice" for entity in result), (
+        "Entity of Alice should be present in the results"
+    )
+
+    # Search with "AND" operator
+    result = await vector_engine.search(
+        collection_name="Entity_name",
+        query_vector=query_vector,
+        include_payload=True,
+        limit=None,
+        node_name=node_set,
+        node_name_filter_operator="AND",
+    )
+
+    assert all(entity.payload["text"].lower() != "alice" for entity in result), (
+        "Entity of Alice should NOT be present in the results"
+    )
+
+
+async def test_vector_nodeset_filtering_retriever_integration():
+    node_set = ["NLP", "Quantum"]
+    query_text = "Tell me about Quantum computers"
+
+    from cognee.modules.retrieval.chunks_retriever import ChunksRetriever
+
+    # Search with "OR" operator
+    retriever = ChunksRetriever(node_name=node_set, node_name_filter_operator="OR")
+    retrieved_objects = await retriever.get_retrieved_objects(query=query_text)
+
+    assert any("NLP" in chunk.payload["text"] for chunk in retrieved_objects)
+    assert any("Quantum" in chunk.payload["text"] for chunk in retrieved_objects)
+
+    # Search with "AND" operator
+    retriever = ChunksRetriever(node_name=node_set, node_name_filter_operator="AND")
+    retrieved_objects = await retriever.get_retrieved_objects(query=query_text)
+
+    assert len(retrieved_objects) == 0, (
+        f"Results for search with all nodesets in {node_set} should be empty"
+    )
+
+    node_set = ["Quantum", "Computers"]
+
+    # Search with "OR" operator
+    retriever = ChunksRetriever(node_name=node_set, node_name_filter_operator="OR")
+    retrieved_objects = await retriever.get_retrieved_objects(query=query_text)
+
+    assert any("Alice" in chunk.payload["text"] for chunk in retrieved_objects)
+
+    # Search with "AND" operator
+    retriever = ChunksRetriever(node_name=node_set, node_name_filter_operator="AND")
+    retrieved_objects = await retriever.get_retrieved_objects(query=query_text)
+
+    assert all("Alice" not in chunk.payload["text"] for chunk in retrieved_objects)
 
 
 async def main():
@@ -125,6 +230,9 @@ async def main():
     )
     cognee.config.system_root_directory(cognee_directory_path)
 
+    node_set_a = ["NLP"]
+    node_set_b = ["Quantum", "Computers"]
+
     await cognee.prune.prune_data()
     await cognee.prune.prune_system(metadata=True)
 
@@ -134,22 +242,27 @@ async def main():
     explanation_file_path_nlp = os.path.join(
         pathlib.Path(__file__).parent, "test_data/Natural_language_processing.txt"
     )
-    await cognee.add([explanation_file_path_nlp], dataset_name_1)
+    await cognee.add([explanation_file_path_nlp], dataset_name_1, node_set=node_set_a)
 
     explanation_file_path_quantum = os.path.join(
         pathlib.Path(__file__).parent, "test_data/Quantum_computers.txt"
     )
 
-    await cognee.add([explanation_file_path_quantum], dataset_name_2)
+    await cognee.add([explanation_file_path_quantum], dataset_name_2, node_set=node_set_b)
 
     await cognee.cognify([dataset_name_2, dataset_name_1])
 
-    from cognee.infrastructure.databases.vector import get_vector_engine
+    from cognee.infrastructure.databases.vector import get_vector_engine_async
+    from cognee.modules.data.methods import get_datasets_by_name
 
-    await test_getting_of_documents(dataset_name_1)
+    user = await get_default_user()
+    dataset_1 = (await get_datasets_by_name([dataset_name_1], user.id))[0]
+    await test_getting_of_documents(dataset_1.id)
 
-    vector_engine = get_vector_engine()
-    random_node = (await vector_engine.search("Entity_name", "Quantum computer"))[0]
+    vector_engine = await get_vector_engine_async()
+    random_node = (
+        await vector_engine.search("Entity_name", "Quantum computer", include_payload=True)
+    )[0]
     random_node_name = random_node.payload["text"]
 
     search_results = await cognee.search(
@@ -186,8 +299,19 @@ async def main():
         print(f"{result}\n")
 
     user = await get_default_user()
-    history = await get_history(user.id)
-    assert len(history) == 8, "Search history is not correct."
+    # Two datasets, so an unscoped search records a query and a result per
+    # dataset while a scoped one records a single pair: 2 + 1 + 1 + 2 = 6 queries, each with its result.
+    # limit=0 lifts get_history's default cap of 10.
+    history = await get_history(user.id, limit=0)
+    assert len(history) == 12, "Search history is not correct."
+
+    await test_vector_engine_search_none_limit()
+
+    await test_vector_engine_search_with_nodeset_filtering()
+    # Note: make sure to call test_vector_engine_search_with_nodeset_filtering()
+    # before test_vector_nodeset_filtering_retriever_integration() because another cognify happens in the first test,
+    # and the second one depends on it. Done like this to minimize number of cognify invocations.
+    await test_vector_nodeset_filtering_retriever_integration()
 
     await cognee.prune.prune_data()
     data_root_directory = get_storage_config()["data_root_directory"]
@@ -198,7 +322,8 @@ async def main():
     tables_in_database = await connection.table_names()
     assert len(tables_in_database) == 0, "LanceDB database is not empty"
 
-    await test_vector_engine_search_none_limit()
+    if hasattr(vector_engine, "close"):
+        await vector_engine.close()
 
 
 if __name__ == "__main__":

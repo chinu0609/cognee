@@ -1,15 +1,15 @@
-from typing import Optional
 from uuid import UUID as uuid_UUID
+
 from fastapi_users import schemas
 from fastapi_users.db import SQLAlchemyBaseUserTableUUID
-from sqlalchemy import ForeignKey, Column, UUID
-from sqlalchemy.orm import relationship, Mapped
+from sqlalchemy import UUID, Column, ForeignKey
+from sqlalchemy.orm import Mapped, relationship
 
 from .Principal import Principal
-from .UserTenant import UserTenant
-from .UserRole import UserRole
 from .Role import Role
 from .Tenant import Tenant
+from .UserRole import UserRole
+from .UserTenant import UserTenant
 
 
 class User(SQLAlchemyBaseUserTableUUID, Principal):
@@ -19,6 +19,10 @@ class User(SQLAlchemyBaseUserTableUUID, Principal):
 
     # Foreign key to current Tenant (Many-to-One relationship)
     tenant_id = Column(UUID, ForeignKey("tenants.id"))
+
+    # Parent user — when an agent/service user creates datasets, the parent
+    # inherits full permissions automatically. Null for regular human users.
+    parent_user_id = Column(UUID, ForeignKey("users.id", ondelete="SET NULL"), nullable=True)
 
     # Many-to-Many Relationship with Roles
     roles: Mapped[list["Role"]] = relationship(
@@ -44,11 +48,13 @@ class User(SQLAlchemyBaseUserTableUUID, Principal):
 
 # Keep these schemas in sync with User model
 class UserRead(schemas.BaseUser[uuid_UUID]):
-    tenant_id: Optional[uuid_UUID] = None
+    tenant_id: uuid_UUID | None = None
+    parent_user_id: uuid_UUID | None = None
 
 
 class UserCreate(schemas.BaseUserCreate):
     is_verified: bool = True
+    parent_user_id: uuid_UUID | None = None
 
 
 class UserUpdate(schemas.BaseUserUpdate):

@@ -1,19 +1,31 @@
 import asyncio
-from typing import Any, Callable, Optional
+import re
+from collections.abc import Callable
 from heapq import nlargest
+from typing import Any
 
 from cognee.infrastructure.databases.graph import get_graph_engine
 from cognee.modules.retrieval.base_retriever import BaseRetriever
 from cognee.modules.retrieval.exceptions.exceptions import NoDataError
 from cognee.shared.logging_utils import get_logger
 
-
 logger = get_logger("LexicalRetriever")
+
+
+def tokenize_words(text: str, stop_words: set[str] | None = None) -> list[str]:
+    """Lowercase, split on word characters, and drop any stop words.
+
+    Shared by the lexical retrievers so tokenization stays consistent across scorers.
+    """
+    tokens = re.findall(r"\w+", text.lower())
+    if not stop_words:
+        return tokens
+    return [token for token in tokens if token not in stop_words]
 
 
 class LexicalRetriever(BaseRetriever):
     def __init__(
-        self, tokenizer: Callable, scorer: Callable, top_k: int = 10, with_scores: bool = False
+        self, tokenizer: Callable, scorer: Callable, top_k: int = 15, with_scores: bool = False
     ):
         if not callable(tokenizer) or not callable(scorer):
             raise TypeError("tokenizer and scorer must be callables")
@@ -51,7 +63,7 @@ class LexicalRetriever(BaseRetriever):
                 try:
                     chunk_id, document = node
                 except Exception:
-                    logger.warning("Skipping node with unexpected shape: %r", node)
+                    logger.warning("Skipping node with unexpected shape: %r", node, exc_info=True)
                     continue
 
                 if document.get("type") == "DocumentChunk" and document.get("text"):
@@ -59,11 +71,15 @@ class LexicalRetriever(BaseRetriever):
                         tokens = self.tokenizer(document["text"])
                         if not tokens:
                             continue
-                        self.chunks[str(document.get("id", chunk_id))] = tokens
-                        self.payloads[str(document.get("id", chunk_id))] = document
+                        # Some graph adapters (e.g. kuzu) omit "id" from node payloads;
+                        # downstream consumers match chunks across channels by payload id.
+                        document_id = str(document.get("id") or chunk_id)
+                        document.setdefault("id", document_id)
+                        self.chunks[document_id] = tokens
+                        self.payloads[document_id] = document
                         chunk_count += 1
-                    except Exception as e:
-                        logger.error("Tokenizer failed for chunk %s: %s", chunk_id, str(e))
+                    except Exception:
+                        logger.exception("Tokenizer failed for chunk %s", chunk_id)
 
             if chunk_count == 0:
                 logger.error("Initialization completed but no valid chunks were loaded.")
@@ -72,7 +88,7 @@ class LexicalRetriever(BaseRetriever):
             self._initialized = True
             logger.info("Initialized with %d document chunks", len(self.chunks))
 
-    async def get_context(self, query: str) -> Any:
+    async def get_retrieved_objects(self, query: str) -> Any:
         """Retrieves relevant chunks for the given query."""
         if not self._initialized:
             await self.initialize()
@@ -83,8 +99,8 @@ class LexicalRetriever(BaseRetriever):
 
         try:
             query_tokens = self.tokenizer(query)
-        except Exception as e:
-            logger.error("Failed to tokenize query: %s", str(e))
+        except Exception:
+            logger.exception("Failed to tokenize query")
             return []
 
         if not query_tokens:
@@ -98,8 +114,8 @@ class LexicalRetriever(BaseRetriever):
                 if not isinstance(score, (int, float)):
                     logger.warning("Non-numeric score for chunk %s → treated as 0.0", chunk_id)
                     score = 0.0
-            except Exception as e:
-                logger.error("Scorer failed for chunk %s: %s", chunk_id, str(e))
+            except Exception:
+                logger.exception("Scorer failed for chunk %s", chunk_id)
                 score = 0.0
             results.append((chunk_id, score))
 
@@ -116,11 +132,36 @@ class LexicalRetriever(BaseRetriever):
         else:
             return [self.payloads[chunk_id] for chunk_id, _ in top_results]
 
-    async def get_completion(
-        self, query: str, context: Optional[Any] = None, session_id: Optional[str] = None
-    ) -> Any:
+    async def get_context_from_objects(self, query: str, retrieved_objects: Any) -> str:
         """
-        Returns context for the given query (retrieves if not provided).
+        Retrieves context from retrieved chunks, in text form.
+
+        Parameters:
+        -----------
+
+            - query (str): The query string used to search for relevant document chunk payloads.
+            - retrieved_objects (Any): The retrieved objects to be used for generating textual context.
+
+        Returns:
+        --------
+
+            - str: A string containing the combined text of the retrieved chunk payloads, or an
+              empty string if none are found.
+        """
+        if retrieved_objects:
+            payload_texts = [payload["text"] for payload in retrieved_objects]
+            return "\n".join(payload_texts)
+        else:
+            return ""
+
+    async def get_completion_from_context(
+        self, query: str, retrieved_objects: Any, context: Any
+    ) -> list[str] | list[dict]:
+        """
+        Returns a completion for the given query.
+
+        In case of the Lexical Retriever, we do not generate a completion, we just return
+        the scored chunk payloads, i.e. the retrieved objects.
 
         Parameters:
         -----------
@@ -128,14 +169,11 @@ class LexicalRetriever(BaseRetriever):
             - query (str): The query string to retrieve context for.
             - context (Optional[Any]): Optional pre-fetched context; if None, it retrieves
               the context for the query. (default None)
-            - session_id (Optional[str]): Optional session identifier for caching. If None,
-              defaults to 'default_session'. (default None)
 
         Returns:
         --------
 
-            - Any: The context, either provided or retrieved.
+            - List[dict]: The retrieved objects, i.e. the scored payloads.
         """
-        if context is None:
-            context = await self.get_context(query)
-        return context
+        # TODO: Do we want to generate a completion using LLM here?
+        return retrieved_objects

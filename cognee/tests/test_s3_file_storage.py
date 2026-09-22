@@ -5,9 +5,9 @@ from uuid import uuid4
 import cognee
 from cognee.infrastructure.files.storage import get_file_storage, get_storage_config
 from cognee.modules.search.operations import get_history
+from cognee.modules.search.types import SearchType
 from cognee.modules.users.methods import get_default_user
 from cognee.shared.logging_utils import get_logger
-from cognee.modules.search.types import SearchType
 
 logger = get_logger()
 
@@ -40,10 +40,10 @@ async def main():
 
     await cognee.cognify([dataset_name])
 
-    from cognee.infrastructure.databases.vector import get_vector_engine
+    from cognee.infrastructure.databases.vector import get_vector_engine_async
 
-    vector_engine = get_vector_engine()
-    random_node = (await vector_engine.search("Entity_name", "AI"))[0]
+    vector_engine = await get_vector_engine_async()
+    random_node = (await vector_engine.search("Entity_name", "AI", include_payload=True))[0]
     random_node_name = random_node.payload["text"]
 
     search_results = await cognee.search(
@@ -99,16 +99,23 @@ async def main():
     from cognee.infrastructure.databases.graph import get_graph_config
 
     graph_config = get_graph_config()
-    # For Kuzu v0.11.0+, check if database file doesn't exist (single-file format with .kuzu extension)
+    # For Ladybug/Kuzu, check if database file doesn't exist.
     # For older versions or other providers, check if directory is empty
-    if graph_config.graph_database_provider.lower() == "kuzu":
-        assert not os.path.exists(graph_config.graph_file_path), (
-            "Kuzu graph database file still exists"
+    if graph_config.graph_database_provider.lower() in ("ladybug", "kuzu"):
+        graph_dir = os.path.dirname(graph_config.graph_file_path)
+        graph_file = os.path.basename(graph_config.graph_file_path)
+        graph_storage = get_file_storage(graph_dir)
+        assert not await graph_storage.file_exists(graph_file), (
+            "Ladybug graph database file still exists"
         )
     else:
-        assert not os.path.exists(graph_config.graph_file_path) or not os.listdir(
-            graph_config.graph_file_path
-        ), "Graph database directory is not empty"
+        graph_storage = get_file_storage(graph_config.graph_file_path)
+        graph_exists = await graph_storage.file_exists("")
+        graph_is_file = await graph_storage.is_file("")
+        graph_files = await graph_storage.list_files("", recursive=True)
+        assert not graph_exists or (not graph_is_file and not graph_files), (
+            "Graph database directory is not empty"
+        )
 
 
 if __name__ == "__main__":

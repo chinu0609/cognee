@@ -1,12 +1,27 @@
-from typing import List, Optional, Type, Union
+from __future__ import annotations
 
-from cognee.shared.logging_utils import get_logger, ERROR
-from cognee.modules.graph.exceptions.exceptions import EntityNotFoundError
+from typing import TYPE_CHECKING
+
+from cognee.base_config import get_base_config
+from cognee.exceptions import CogneeValidationError
 from cognee.infrastructure.databases.graph import get_graph_engine
 from cognee.infrastructure.databases.vector.exceptions import CollectionNotFoundError
 from cognee.modules.graph.cognee_graph.CogneeGraph import CogneeGraph
 from cognee.modules.graph.cognee_graph.CogneeGraphElements import Edge
+from cognee.modules.graph.exceptions.exceptions import EntityNotFoundError
+from cognee.modules.observability import (
+    COGNEE_RESULT_SUMMARY,
+    COGNEE_VECTOR_COLLECTION,
+    COGNEE_VECTOR_RESULT_COUNT,
+    new_span,
+)
+from cognee.modules.observability import OtelStatusCode as StatusCode
 from cognee.modules.retrieval.utils.node_edge_vector_search import NodeEdgeVectorSearch
+from cognee.modules.retrieval.utils.validate_queries import validate_queries
+from cognee.shared.logging_utils import ERROR, get_logger
+
+if TYPE_CHECKING:
+    from cognee.infrastructure.databases.unified import UnifiedStoreEngine
 
 logger = get_logger(level=ERROR)
 
@@ -32,53 +47,105 @@ def format_triplets(edges):
 
 
 async def get_memory_fragment(
-    properties_to_project: Optional[List[str]] = None,
-    node_type: Optional[Type] = None,
-    node_name: Optional[List[str]] = None,
-    relevant_ids_to_filter: Optional[List[str]] = None,
-    triplet_distance_penalty: Optional[float] = 3.5,
+    properties_to_project: list[str] | None = None,
+    node_type: type | None = None,
+    node_name: list[str] | None = None,
+    node_name_filter_operator: str = "OR",
+    relevant_ids_to_filter: list[str] | None = None,
+    memory_fragment_filter: list[dict] | None = None,
+    triplet_distance_penalty: float | None = 6.5,
+    feedback_influence: float = get_base_config().default_feedback_influence,
+    graph_engine=None,
+    neighborhood_depth: int | None = None,
+    neighborhood_seed_top_k: int | None = 10,
 ) -> CogneeGraph:
     """Creates and initializes a CogneeGraph memory fragment with optional property projections."""
     if properties_to_project is None:
-        properties_to_project = ["id", "description", "name", "type", "text"]
+        properties_to_project = ["id", "description", "name", "type", "text", "importance_weight"]
+
+    node_properties_to_project = list(properties_to_project)
+    edge_properties_to_project = ["relationship_name", "edge_text", "edge_object_id"]
+
+    if feedback_influence > 0.0:
+        if "feedback_weight" not in node_properties_to_project:
+            node_properties_to_project.append("feedback_weight")
+        if "feedback_weight" not in edge_properties_to_project:
+            edge_properties_to_project.append("feedback_weight")
 
     memory_fragment = CogneeGraph()
 
     try:
-        graph_engine = await get_graph_engine()
-        await memory_fragment.project_graph_from_db(
-            graph_engine,
-            node_properties_to_project=properties_to_project,
-            edge_properties_to_project=["relationship_name", "edge_text"],
-            node_type=node_type,
-            node_name=node_name,
-            relevant_ids_to_filter=relevant_ids_to_filter,
-            triplet_distance_penalty=triplet_distance_penalty,
-        )
+        if graph_engine is None:
+            graph_engine = await get_graph_engine()
+
+        if neighborhood_depth is not None and relevant_ids_to_filter:
+            # Use neighborhood-based projection with seed nodes
+            seed_ids = relevant_ids_to_filter[:neighborhood_seed_top_k]
+            await memory_fragment.project_neighborhood_from_db(
+                graph_engine,
+                node_properties_to_project=node_properties_to_project,
+                edge_properties_to_project=edge_properties_to_project,
+                seed_node_ids=seed_ids,
+                depth=neighborhood_depth,
+                triplet_distance_penalty=triplet_distance_penalty,
+                feedback_influence=feedback_influence,
+            )
+        elif neighborhood_depth is not None and not relevant_ids_to_filter:
+            raise ValueError(
+                "neighborhood_depth requires seed node IDs from vector search "
+                "(set wide_search_top_k to a positive integer)"
+            )
+        else:
+            await memory_fragment.project_graph_from_db(
+                graph_engine,
+                node_properties_to_project=node_properties_to_project,
+                edge_properties_to_project=edge_properties_to_project,
+                node_type=node_type,
+                node_name=node_name,
+                node_name_filter_operator=node_name_filter_operator,
+                relevant_ids_to_filter=relevant_ids_to_filter,
+                memory_fragment_filter=memory_fragment_filter or [],
+                triplet_distance_penalty=triplet_distance_penalty,
+                feedback_influence=feedback_influence,
+            )
     except EntityNotFoundError:
         pass
-    except Exception as e:
-        logger.error(f"Error during memory fragment creation: {str(e)}")
+    except Exception:
+        logger.exception("Error during memory fragment creation")
 
     return memory_fragment
 
 
 async def _get_top_triplet_importances(
-    memory_fragment: Optional[CogneeGraph],
+    memory_fragment: CogneeGraph | None,
     vector_search: NodeEdgeVectorSearch,
-    properties_to_project: Optional[List[str]],
-    node_type: Optional[Type],
-    node_name: Optional[List[str]],
+    properties_to_project: list[str] | None,
+    node_type: type | None,
+    node_name: list[str] | None,
+    node_name_filter_operator: str,
     triplet_distance_penalty: float,
-    wide_search_limit: Optional[int],
+    feedback_influence: float,
+    wide_search_limit: int | None,
     top_k: int,
-    query_list_length: Optional[int] = None,
-) -> Union[List[Edge], List[List[Edge]]]:
+    query_list_length: int | None = None,
+    graph_engine=None,
+    neighborhood_depth: int | None = None,
+    neighborhood_seed_top_k: int | None = 10,
+    personal_weights: dict[str, float] | None = None,
+) -> list[Edge] | list[list[Edge]]:
     """Creates memory fragment (if needed), maps distances, and calculates top triplet importances.
 
     Args:
         query_list_length: Number of queries in batch mode (None for single-query mode).
             When None, node_distances/edge_distances are flat lists; when set, they are list-of-lists.
+        graph_engine: Optional pre-created graph engine to pass through to
+            ``get_memory_fragment()``.
+        neighborhood_depth: If set, extract a k-hop neighborhood around seed nodes
+            instead of projecting the full or ID-filtered graph.
+        neighborhood_seed_top_k: Maximum number of seed nodes to use for neighborhood
+            extraction. (default 10)
+        personal_weights: Optional per-node ``prefers`` weights (node id -> weight in
+            [0, 1]) applied to matching nodes so the triplet scorer can nudge ranking.
 
     Returns:
         List[Edge]: For single-query mode (query_list_length is None).
@@ -94,9 +161,45 @@ async def _get_top_triplet_importances(
             properties_to_project=properties_to_project,
             node_type=node_type,
             node_name=node_name,
+            node_name_filter_operator=node_name_filter_operator,
             relevant_ids_to_filter=relevant_node_ids,
             triplet_distance_penalty=triplet_distance_penalty,
+            feedback_influence=feedback_influence,
+            graph_engine=graph_engine,
+            neighborhood_depth=neighborhood_depth,
+            neighborhood_seed_top_k=neighborhood_seed_top_k,
         )
+
+        # Score only newly discovered IDs; node_name filters NodeSet membership,
+        # not node IDs. This path is single-query only (batch mode has no seed IDs).
+        if (
+            neighborhood_depth is not None
+            and relevant_node_ids
+            and vector_search.query_vector is not None
+        ):
+            seed_set = {str(node_id) for node_id in relevant_node_ids}
+            expansion_ids = list(
+                dict.fromkeys(
+                    str(node_id)
+                    for node_id in memory_fragment.nodes
+                    if str(node_id) not in seed_set
+                )
+            )
+            score_by_ids = getattr(vector_search.vector_engine, "score_by_ids", None)
+            if expansion_ids and score_by_ids is not None:
+                for collection_name, distances in vector_search.node_distances.items():
+                    try:
+                        extra_scores = await score_by_ids(
+                            collection_name=collection_name,
+                            data_point_ids=expansion_ids,
+                            query_vector=vector_search.query_vector,
+                        )
+                    except CollectionNotFoundError:
+                        continue
+                    except NotImplementedError:
+                        logger.debug("Vector adapter does not support neighborhood ID scoring")
+                        break
+                    distances.extend(extra_scores)
 
     await memory_fragment.map_vector_distances_to_graph_nodes(
         node_distances=vector_search.node_distances, query_list_length=query_list_length
@@ -105,23 +208,36 @@ async def _get_top_triplet_importances(
         edge_distances=vector_search.edge_distances, query_list_length=query_list_length
     )
 
+    # After projection and distance mapping so the weights land on the nodes
+    # that actually made it into the fragment.
+    if personal_weights:
+        memory_fragment.apply_personal_weights(personal_weights)
+
     return await memory_fragment.calculate_top_triplet_importances(
-        k=top_k, query_list_length=query_list_length
+        k=top_k,
+        query_list_length=query_list_length,
+        feedback_influence=feedback_influence,
     )
 
 
 async def brute_force_triplet_search(
-    query: Optional[str] = None,
-    query_batch: Optional[List[str]] = None,
+    query: str | None = None,
+    query_batch: list[str] | None = None,
     top_k: int = 5,
-    collections: Optional[List[str]] = None,
-    properties_to_project: Optional[List[str]] = None,
-    memory_fragment: Optional[CogneeGraph] = None,
-    node_type: Optional[Type] = None,
-    node_name: Optional[List[str]] = None,
-    wide_search_top_k: Optional[int] = 100,
-    triplet_distance_penalty: Optional[float] = 3.5,
-) -> Union[List[Edge], List[List[Edge]]]:
+    collections: list[str] | None = None,
+    properties_to_project: list[str] | None = None,
+    memory_fragment: CogneeGraph | None = None,
+    node_type: type | None = None,
+    node_name: list[str] | None = None,
+    node_name_filter_operator: str = "OR",
+    wide_search_top_k: int | None = 100,
+    triplet_distance_penalty: float | None = 6.5,
+    feedback_influence: float = get_base_config().default_feedback_influence,
+    unified_engine: UnifiedStoreEngine | None = None,
+    neighborhood_depth: int | None = None,
+    neighborhood_seed_top_k: int | None = 10,
+    personal_weights: dict[str, float] | None = None,
+) -> list[Edge] | list[list[Edge]]:
     """
     Performs a brute force search to retrieve the top triplets from the graph.
 
@@ -137,6 +253,9 @@ async def brute_force_triplet_search(
         wide_search_top_k (Optional[int]): Number of initial elements to retrieve from collections.
             Ignored in batch mode (always None to project full graph).
         triplet_distance_penalty (Optional[float]): Default distance penalty in graph projection
+        feedback_influence (float): Weight of feedback influence in range [0, 1]
+        personal_weights (Optional[Dict[str, float]]): Per-node prefers weights
+            (node id -> weight in [0, 1]) that nudge triplet ranking for the active user.
 
     Returns:
         List[Edge]: The top triplet results for single query mode (flat list).
@@ -146,68 +265,110 @@ async def brute_force_triplet_search(
         In single-query mode, node_distances and edge_distances are stored as flat lists.
         In batch mode, they are stored as list-of-lists (one list per query).
     """
-    if query is not None and query_batch is not None:
-        raise ValueError("Cannot provide both 'query' and 'query_batch'; use exactly one.")
-    if query is None and query_batch is None:
-        raise ValueError("Must provide either 'query' or 'query_batch'.")
-    if query is not None and (not query or not isinstance(query, str)):
-        raise ValueError("The query must be a non-empty string.")
-    if query_batch is not None:
-        if not isinstance(query_batch, list) or not query_batch:
-            raise ValueError("query_batch must be a non-empty list of strings.")
-        if not all(isinstance(q, str) and q for q in query_batch):
-            raise ValueError("All items in query_batch must be non-empty strings.")
+    is_query_valid, msg = validate_queries(query, query_batch)
+    if not is_query_valid:
+        raise ValueError(msg)
+
     if top_k <= 0:
         raise ValueError("top_k must be a positive integer.")
-
-    query_list_length = len(query_batch) if query_batch is not None else None
-    wide_search_limit = (
-        None if query_list_length else (wide_search_top_k if node_name is None else None)
-    )
-
-    if collections is None:
-        collections = [
-            "Entity_name",
-            "TextSummary_text",
-            "EntityType_name",
-            "DocumentChunk_text",
-        ]
-
-    if "EdgeType_relationship_name" not in collections:
-        collections.append("EdgeType_relationship_name")
-
-    try:
-        vector_search = NodeEdgeVectorSearch()
-
-        await vector_search.embed_and_retrieve_distances(
-            query=None if query_list_length else query,
-            query_batch=query_batch if query_list_length else None,
-            collections=collections,
-            wide_search_limit=wide_search_limit,
+    if not 0.0 <= feedback_influence <= 1.0:
+        raise CogneeValidationError(
+            message="feedback_influence must be in range [0, 1]",
+            name="InvalidFeedbackInfluenceError",
         )
 
-        if not vector_search.has_results():
+    with new_span("cognee.retrieval.triplet_search") as otel_span:
+        otel_span.set_attribute("cognee.retrieval.top_k", top_k)
+        otel_span.set_attribute(
+            "cognee.retrieval.mode", "batch" if query_batch is not None else "single"
+        )
+
+        query_list_length = len(query_batch) if query_batch is not None else None
+        wide_search_limit = (
+            None if query_list_length else (wide_search_top_k if node_name is None else None)
+        )
+
+        if collections is None:
+            collections = [
+                "Entity_name",
+                "TextSummary_text",
+                "EntityType_name",
+                "DocumentChunk_text",
+                # DLT rows live in their own collection — chunk search
+                # is documents-only, but graph completion covers row text too.
+                "DltRow_text",
+            ]
+        else:
+            # Copy so the caller's list is never mutated. Callers such as
+            # TripletSearchContextProvider pass a persistent ``self.collections``
+            # that is shared across concurrent per-entity searches; appending the
+            # edge collection in place would leak into that shared list.
+            collections = list(collections)
+
+        if "EdgeType_relationship_name" not in collections:
+            collections.append("EdgeType_relationship_name")
+
+        otel_span.set_attribute("cognee.retrieval.collection_count", len(collections))
+        otel_span.set_attribute(COGNEE_VECTOR_COLLECTION, ", ".join(collections))
+
+        try:
+            vector_engine = unified_engine.vector if unified_engine else None
+            graph_engine = unified_engine.graph if unified_engine else None
+
+            vector_search = NodeEdgeVectorSearch(vector_engine=vector_engine)
+
+            await vector_search.embed_and_retrieve_distances(
+                query=None if query_list_length else query,
+                query_batch=query_batch if query_list_length else None,
+                collections=collections,
+                wide_search_limit=wide_search_limit,
+                node_name=node_name,
+                node_name_filter_operator=node_name_filter_operator,
+            )
+
+            if query_batch is not None:
+                otel_span.set_attribute("cognee.retrieval.batch_size", len(query_batch))
+
+            if not vector_search.has_results():
+                otel_span.set_attribute(COGNEE_VECTOR_RESULT_COUNT, 0)
+                otel_span.set_attribute(COGNEE_RESULT_SUMMARY, "No vector results found")
+                return [[] for _ in range(query_list_length)] if query_list_length else []
+
+            results = await _get_top_triplet_importances(
+                memory_fragment,
+                vector_search,
+                properties_to_project,
+                node_type,
+                node_name,
+                node_name_filter_operator,
+                triplet_distance_penalty,
+                feedback_influence,
+                wide_search_limit,
+                top_k,
+                query_list_length=query_list_length,
+                graph_engine=graph_engine,
+                neighborhood_depth=neighborhood_depth,
+                neighborhood_seed_top_k=neighborhood_seed_top_k,
+                personal_weights=personal_weights,
+            )
+
+            result_count = sum(len(r) for r in results) if query_list_length else len(results)
+            otel_span.set_attribute(COGNEE_VECTOR_RESULT_COUNT, result_count)
+            otel_span.set_attribute(
+                COGNEE_RESULT_SUMMARY,
+                f"Found {result_count} triplet(s) from {len(collections)} collection(s)",
+            )
+
+            return results
+        except CollectionNotFoundError:
             return [[] for _ in range(query_list_length)] if query_list_length else []
+        except Exception as error:
+            otel_span.set_status(StatusCode.ERROR, str(error))
+            otel_span.record_exception(error)
 
-        results = await _get_top_triplet_importances(
-            memory_fragment,
-            vector_search,
-            properties_to_project,
-            node_type,
-            node_name,
-            triplet_distance_penalty,
-            wide_search_limit,
-            top_k,
-            query_list_length=query_list_length,
-        )
-
-        return results
-    except CollectionNotFoundError:
-        return [[] for _ in range(query_list_length)] if query_list_length else []
-    except Exception as error:
-        logger.error(
-            "Error during brute force search for query: %s. Error: %s",
-            query_batch if query_list_length else [query],
-            error,
-        )
-        raise error
+            logger.error(
+                "Error during brute force search for query: %s. Error: %s",
+                query_batch if query_list_length else [query],
+                error,
+            )
+            raise

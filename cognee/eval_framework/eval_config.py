@@ -1,26 +1,29 @@
 from functools import lru_cache
+
 from pydantic_settings import BaseSettings, SettingsConfigDict
-from typing import List, Optional
 
 
 class EvalConfig(BaseSettings):
     # Corpus builder params
     building_corpus_from_scratch: bool = True
     number_of_samples_in_corpus: int = 1
-    benchmark: str = "Dummy"  # Options: 'HotPotQA', 'Dummy', 'TwoWikiMultiHop'
+    benchmark: str = "Dummy"  # Options: 'HotPotQA', 'Dummy', 'TwoWikiMultiHop', 'BEAM'
     task_getter_type: str = (
         "Default"  # Options: 'Default', 'CascadeGraph', 'NoSummaries', 'JustChunks'
     )
+    chunks_per_batch: int | None = None  # Override chunks_per_batch for the cognify pipeline
 
     # Question answering params
     answering_questions: bool = True
-    qa_engine: str = "cognee_graph_completion"  # Options: 'cognee_completion' or 'cognee_graph_completion' or 'cognee_graph_completion_cot' or 'cognee_graph_completion_context_extension'
+    qa_engine: str = (
+        "cognee_graph_completion"  # See answer_generation.registry for supported strategies.
+    )
 
     # Evaluation params
     evaluating_answers: bool = True
     evaluating_contexts: bool = True
-    evaluation_engine: str = "DeepEval"  # Options: 'DeepEval' (uses deepeval_model), 'DirectLLM' (uses default llm from .env)
-    evaluation_metrics: List[str] = [
+    evaluation_engine: str = "DeepEval"  # Options: 'DeepEval', 'BeamEval', 'DirectLLM'
+    evaluation_metrics: list[str] = [
         "correctness",
         "EM",
         "f1",
@@ -33,6 +36,15 @@ class EvalConfig(BaseSettings):
     # Visualization
     dashboard: bool = True
 
+    # Reproducibility
+    seed: int = 42  # Seed for deterministic corpus sampling across runs
+
+    # Optional directory for run artifacts. When set, the runner namespaces
+    # artifacts under "<results_dir>/<benchmark>_<engine>/" so successive runs
+    # are comparable instead of overwriting each other. When unset, artifacts are
+    # written to the current working directory (legacy behavior).
+    results_dir: str | None = None
+
     # file paths
     questions_path: str = "questions_output.json"
     answers_path: str = "answers_output.json"
@@ -41,7 +53,7 @@ class EvalConfig(BaseSettings):
     dashboard_path: str = "dashboard.html"
     direct_llm_system_prompt: str = "direct_llm_eval_system.txt"
     direct_llm_eval_prompt: str = "direct_llm_eval_prompt.txt"
-    instance_filter: Optional[List[str]] = None
+    instance_filter: list[str] | None = None
 
     model_config = SettingsConfigDict(env_file=".env", extra="allow")
 
@@ -58,6 +70,8 @@ class EvalConfig(BaseSettings):
             "evaluation_metrics": self.evaluation_metrics,
             "calculate_metrics": self.calculate_metrics,
             "dashboard": self.dashboard,
+            "seed": self.seed,
+            "results_dir": self.results_dir,
             "questions_path": self.questions_path,
             "answers_path": self.answers_path,
             "metrics_path": self.metrics_path,
@@ -65,6 +79,7 @@ class EvalConfig(BaseSettings):
             "dashboard_path": self.dashboard_path,
             "deepeval_model": self.deepeval_model,
             "task_getter_type": self.task_getter_type,
+            "chunks_per_batch": self.chunks_per_batch,
             "direct_llm_system_prompt": self.direct_llm_system_prompt,
             "direct_llm_eval_prompt": self.direct_llm_eval_prompt,
             "instance_filter": self.instance_filter,

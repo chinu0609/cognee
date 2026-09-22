@@ -1,12 +1,24 @@
 import asyncio
 import threading
+from collections.abc import Coroutine
+from typing import Any, TypeVar
+
+from cognee.shared.logging_utils import get_logger
+
+logger = get_logger()
+
+T = TypeVar("T")
 
 
-def run_sync(coro, running_loop=None, timeout=None):
+def run_sync(
+    coro: Coroutine[Any, Any, T],
+    running_loop: asyncio.AbstractEventLoop | None = None,
+    timeout: float | None = None,
+) -> T | None:
     result = None
     exception = None
 
-    def runner():
+    def runner() -> None:
         nonlocal result, exception, running_loop
 
         try:
@@ -19,6 +31,7 @@ def run_sync(coro, running_loop=None, timeout=None):
                 result = asyncio.run(coro)
 
         except Exception as e:
+            logger.debug("Ignoring exception in run_sync.runner", exc_info=True)
             exception = e
 
     thread = threading.Thread(target=runner)

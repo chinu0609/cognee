@@ -1,10 +1,11 @@
 import asyncio
 import time
-from typing import Any, List, Optional
+from typing import Any
 
-from cognee.shared.logging_utils import get_logger, ERROR
+from cognee.infrastructure.databases.vector import get_vector_engine_async
 from cognee.infrastructure.databases.vector.exceptions import CollectionNotFoundError
-from cognee.infrastructure.databases.vector import get_vector_engine
+from cognee.modules.observability import COGNEE_VECTOR_COLLECTION, new_span
+from cognee.shared.logging_utils import ERROR, get_logger
 
 logger = get_logger(level=ERROR)
 
@@ -14,25 +15,32 @@ class NodeEdgeVectorSearch:
 
     def __init__(self, edge_collection: str = "EdgeType_relationship_name", vector_engine=None):
         self.edge_collection = edge_collection
-        self.vector_engine = vector_engine or self._init_vector_engine()
-        self.query_vector: Optional[Any] = None
+        # ``get_vector_engine_async()`` is async, so this sync ``__init__`` can't
+        # eagerly resolve it. Keep the (possibly-None) injected engine and
+        # resolve lazily in the first async method via ``_get_vector_engine()``.
+        self.vector_engine = vector_engine
+        self.query_vector: Any | None = None
         self.node_distances: dict[str, list[Any]] = {}
         self.edge_distances: list[Any] = []
-        self.query_list_length: Optional[int] = None
+        self.query_list_length: int | None = None
 
-    def _init_vector_engine(self):
-        try:
-            return get_vector_engine()
-        except Exception as e:
-            logger.error("Failed to initialize vector engine: %s", e)
-            raise RuntimeError("Initialization error") from e
+    async def _get_vector_engine(self):
+        if self.vector_engine is None:
+            try:
+                self.vector_engine = await get_vector_engine_async()
+            except Exception as e:
+                logger.error("Failed to initialize vector engine: %s", e)
+                raise RuntimeError("Initialization error") from e
+        return self.vector_engine
 
     async def embed_and_retrieve_distances(
         self,
-        query: Optional[str] = None,
-        query_batch: Optional[List[str]] = None,
-        collections: List[str] = None,
-        wide_search_limit: Optional[int] = None,
+        query: str | None = None,
+        query_batch: list[str] | None = None,
+        collections: list[str] | None = None,
+        wide_search_limit: int | None = None,
+        node_name: list[str] | None = None,
+        node_name_filter_operator: str = "OR",
     ):
         """Embeds query/queries and retrieves vector distances from all collections."""
         if query is not None and query_batch is not None:
@@ -42,23 +50,38 @@ class NodeEdgeVectorSearch:
         if not collections:
             raise ValueError("'collections' must be a non-empty list.")
 
-        start_time = time.time()
+        with new_span("cognee.retrieval.vector_search") as span:
+            span.set_attribute("cognee.vector.collection_count", len(collections))
+            span.set_attribute(COGNEE_VECTOR_COLLECTION, ", ".join(collections))
+            span.set_attribute(
+                "cognee.vector.mode", "batch" if query_batch is not None else "single"
+            )
+            if wide_search_limit is not None:
+                span.set_attribute("cognee.vector.wide_search_limit", wide_search_limit)
 
-        if query_batch is not None:
-            self.query_list_length = len(query_batch)
-            search_results = await self._run_batch_search(collections, query_batch)
-        else:
-            self.query_list_length = None
-            search_results = await self._run_single_search(collections, query, wide_search_limit)
+            start_time = time.time()
 
-        elapsed_time = time.time() - start_time
-        collections_with_results = sum(1 for result in search_results if any(result))
-        logger.info(
-            f"Vector collection retrieval completed: Retrieved distances from "
-            f"{collections_with_results} collections in {elapsed_time:.2f}s"
-        )
+            if query_batch is not None:
+                self.query_list_length = len(query_batch)
+                span.set_attribute("cognee.vector.batch_size", len(query_batch))
+                search_results = await self._run_batch_search(collections, query_batch)
+            else:
+                self.query_list_length = None
+                search_results = await self._run_single_search(
+                    collections, query, wide_search_limit, node_name, node_name_filter_operator
+                )
 
-        self.set_distances_from_results(collections, search_results, self.query_list_length)
+            elapsed_time = time.time() - start_time
+            collections_with_results = sum(1 for result in search_results if any(result))
+            logger.info(
+                f"Vector collection retrieval completed: Retrieved distances from "
+                f"{collections_with_results} collections in {elapsed_time:.2f}s"
+            )
+
+            span.set_attribute("cognee.vector.collections_with_results", collections_with_results)
+            span.set_attribute("cognee.vector.duration_ms", round(elapsed_time * 1000, 1))
+
+            self.set_distances_from_results(collections, search_results, self.query_list_length)
 
     def has_results(self) -> bool:
         """Checks if any collections returned results."""
@@ -76,7 +99,7 @@ class NodeEdgeVectorSearch:
             for collection_results in self.node_distances.values()
         )
 
-    def extract_relevant_node_ids(self) -> List[str]:
+    def extract_relevant_node_ids(self) -> list[str]:
         """Extracts unique node IDs from search results."""
         if self.query_list_length is not None:
             return []
@@ -90,9 +113,9 @@ class NodeEdgeVectorSearch:
 
     def set_distances_from_results(
         self,
-        collections: List[str],
-        search_results: List[List[Any]],
-        query_list_length: Optional[int] = None,
+        collections: list[str],
+        search_results: list[list[Any]],
+        query_list_length: int | None = None,
     ):
         """Separates search results into node and edge distances with stable shapes.
 
@@ -120,8 +143,8 @@ class NodeEdgeVectorSearch:
                     self.node_distances[collection] = result
 
     async def _run_batch_search(
-        self, collections: List[str], query_batch: List[str]
-    ) -> List[List[Any]]:
+        self, collections: list[str], query_batch: list[str]
+    ) -> list[list[Any]]:
         """Runs batch search across all collections and returns list-of-lists per collection."""
         search_tasks = [
             self._search_batch_collection(collection, query_batch) for collection in collections
@@ -129,27 +152,40 @@ class NodeEdgeVectorSearch:
         return await asyncio.gather(*search_tasks)
 
     async def _search_batch_collection(
-        self, collection_name: str, query_batch: List[str]
-    ) -> List[List[Any]]:
+        self, collection_name: str, query_batch: list[str]
+    ) -> list[list[Any]]:
         """Searches one collection with batch queries and returns list-of-lists."""
         try:
-            return await self.vector_engine.batch_search(
+            vector_engine = await self._get_vector_engine()
+            return await vector_engine.batch_search(
                 collection_name=collection_name, query_texts=query_batch, limit=None
             )
         except CollectionNotFoundError:
             return [[]] * len(query_batch)
 
     async def _run_single_search(
-        self, collections: List[str], query: str, wide_search_limit: Optional[int]
-    ) -> List[List[Any]]:
+        self,
+        collections: list[str],
+        query: str,
+        wide_search_limit: int | None,
+        node_name: list[str] | None,
+        node_name_filter_operator: str,
+    ) -> list[list[Any]]:
         """Runs single query search and returns flat lists per collection.
 
         Returns a list where each element is a collection's results (flat list).
         These are stored as flat lists in node_distances/edge_distances for single-query mode.
         """
         await self._embed_query(query)
+        vector_engine = await self._get_vector_engine()
         search_tasks = [
-            self._search_single_collection(self.vector_engine, wide_search_limit, collection)
+            self._search_single_collection(
+                vector_engine,
+                wide_search_limit,
+                collection,
+                node_name,
+                node_name_filter_operator,
+            )
             for collection in collections
         ]
         search_results = await asyncio.gather(*search_tasks)
@@ -157,11 +193,20 @@ class NodeEdgeVectorSearch:
 
     async def _embed_query(self, query: str):
         """Embeds the query and stores the resulting vector."""
-        query_embeddings = await self.vector_engine.embedding_engine.embed_text([query])
-        self.query_vector = query_embeddings[0]
+        with new_span("cognee.retrieval.embed_query") as span:
+            span.set_attribute("cognee.vector.query_length", len(query))
+            vector_engine = await self._get_vector_engine()
+            query_embeddings = await vector_engine.embedding_engine.embed_text([query])
+            self.query_vector = query_embeddings[0]
+            span.set_attribute("cognee.vector.embedding_dimensions", len(self.query_vector))
 
     async def _search_single_collection(
-        self, vector_engine: Any, wide_search_limit: Optional[int], collection_name: str
+        self,
+        vector_engine: Any,
+        wide_search_limit: int | None,
+        collection_name: str,
+        node_name: list[str] | None,
+        node_name_filter_operator: str,
     ):
         """Searches one collection and returns results or empty list if not found."""
         try:
@@ -169,6 +214,8 @@ class NodeEdgeVectorSearch:
                 collection_name=collection_name,
                 query_vector=self.query_vector,
                 limit=wide_search_limit,
+                node_name=node_name,
+                node_name_filter_operator=node_name_filter_operator,
             )
         except CollectionNotFoundError:
             return []

@@ -1,7 +1,6 @@
-from cognee.modules.retrieval.lexical_retriever import LexicalRetriever
-import re
 from collections import Counter
-from typing import Optional
+
+from cognee.modules.retrieval.lexical_retriever import LexicalRetriever, tokenize_words
 
 
 class JaccardChunksRetriever(LexicalRetriever):
@@ -11,9 +10,9 @@ class JaccardChunksRetriever(LexicalRetriever):
 
     def __init__(
         self,
-        top_k: int = 10,
+        top_k: int = 15,
         with_scores: bool = False,
-        stop_words: Optional[list[str]] = None,
+        stop_words: list[str] | None = None,
         multiset_jaccard: bool = False,
     ):
         """
@@ -36,11 +35,8 @@ class JaccardChunksRetriever(LexicalRetriever):
         )
 
     def _tokenizer(self, text: str) -> list[str]:
-        """
-        Tokenizer: lowercases, splits on word characters (w+), filters stopwords.
-        """
-        tokens = re.findall(r"\w+", text.lower())
-        return [t for t in tokens if t not in self.stop_words]
+        """Tokenizer: lowercases, splits on word characters (w+), filters stopwords."""
+        return tokenize_words(text, self.stop_words)
 
     def _scorer(self, query_tokens: list[str], chunk_tokens: list[str]) -> float:
         """

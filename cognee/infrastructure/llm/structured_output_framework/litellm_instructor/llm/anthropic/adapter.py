@@ -1,24 +1,31 @@
 import logging
-from typing import Type
-from pydantic import BaseModel
-import litellm
+from typing import Any
+
+import anthropic  # ty:ignore[unresolved-import]
 import instructor
-import anthropic
-from cognee.shared.logging_utils import get_logger
-from cognee.modules.observability.get_observe import get_observe
+from instructor.core.patch import AsyncInstructorChatCompletionCreate
+from pydantic import BaseModel
 from tenacity import (
-    retry,
-    stop_after_delay,
-    wait_exponential_jitter,
-    retry_if_not_exception_type,
     before_sleep_log,
+    retry,
+    wait_exponential_jitter,
 )
 
+from cognee.infrastructure.llm.config import get_llm_config
+from cognee.infrastructure.llm.exceptions import raise_if_budget_exhausted
+from cognee.infrastructure.llm.retry_config import (
+    llm_retry_condition,
+    llm_retry_stop_condition,
+)
 from cognee.infrastructure.llm.structured_output_framework.litellm_instructor.llm.generic_llm_api.adapter import (
     GenericAPIAdapter,
 )
+from cognee.infrastructure.llm.structured_output_framework.litellm_instructor.llm.instructor_modes import (
+    get_instructor_mode,
+)
+from cognee.modules.observability.get_observe import get_observe
+from cognee.shared.logging_utils import get_logger
 from cognee.shared.rate_limiting import llm_rate_limiter_context_manager
-from cognee.infrastructure.llm.config import get_llm_config
 
 logger = get_logger()
 observe = get_observe()
@@ -30,34 +37,61 @@ class AnthropicAdapter(GenericAPIAdapter):
     and prompt display.
     """
 
-    default_instructor_mode = "anthropic_tools"
+    # Declared False even though GenericAPIAdapter declares True. This class
+    # overrides acreate_structured_output without a `response_model is str`
+    # branch and defines no acreate_str_output, so a plain-text answer never
+    # reaches the parent's streaming door. Inheriting True would promote a
+    # sink, announce `stage: generating`, and then emit nothing at all.
+    supports_answer_streaming = False
+
+    default_instructor_mode = get_instructor_mode("anthropic")
 
     def __init__(
-        self, api_key: str, model: str, max_completion_tokens: int, instructor_mode: str = None
-    ):
+        self,
+        api_key: str,
+        model: str,
+        max_completion_tokens: int,
+        transcription_model: str | None = None,
+        image_transcribe_model: str | None = None,
+        instructor_mode: str | None = None,
+        llm_args: dict[str, Any] | None = None,
+    ) -> None:
+        # Support both "model" and "anthropic/model" formats for model names, stripping the "anthropic/" prefix
+        model = model.removeprefix("anthropic/") if model.startswith("anthropic/") else model
         super().__init__(
             api_key=api_key,
             model=model,
             max_completion_tokens=max_completion_tokens,
             name="Anthropic",
+            transcription_model=transcription_model,
+            image_transcribe_model=image_transcribe_model,
+            llm_args=llm_args,
         )
+        self.llm_args: dict[str, Any] = llm_args or {}
+        # Anthropic's messages.create requires max_tokens. Unlike the litellm path used by
+        # GenericAPIAdapter, instructor.patch around the raw Anthropic SDK does not auto-inject
+        # it, so we surface max_completion_tokens here.
+        self.llm_args.setdefault("max_tokens", max_completion_tokens)
         self.instructor_mode = instructor_mode if instructor_mode else self.default_instructor_mode
 
-        self.aclient = instructor.patch(
-            create=anthropic.AsyncAnthropic(api_key=self.api_key).messages.create,
+        self.aclient: AsyncInstructorChatCompletionCreate = instructor.patch(
+            create=anthropic.AsyncAnthropic(
+                api_key=self.api_key,
+                http_client=anthropic.DefaultAsyncHttpxClient(http2=False),
+            ).messages.create,
             mode=instructor.Mode(self.instructor_mode),
         )
 
     @observe(as_type="generation")
     @retry(
-        stop=stop_after_delay(128),
+        stop=llm_retry_stop_condition,
         wait=wait_exponential_jitter(8, 128),
-        retry=retry_if_not_exception_type(litellm.exceptions.NotFoundError),
-        before_sleep=before_sleep_log(logger, logging.DEBUG),
+        retry=llm_retry_condition,
+        before_sleep=before_sleep_log(logger, logging.WARNING),
         reraise=True,
     )
     async def acreate_structured_output(
-        self, text_input: str, system_prompt: str, response_model: Type[BaseModel], **kwargs
+        self, text_input: str, system_prompt: str, response_model: type[BaseModel], **kwargs: Any
     ) -> BaseModel:
         """
         Generate a response from a user query.
@@ -75,17 +109,23 @@ class AnthropicAdapter(GenericAPIAdapter):
 
             - BaseModel: An instance of BaseModel containing the structured response.
         """
-        async with llm_rate_limiter_context_manager():
-            return await self.aclient(
-                model=self.model,
-                max_tokens=4096,
-                max_retries=2,
-                messages=[
-                    {
-                        "role": "user",
-                        "content": f"""Use the given format to extract information
+        merged_kwargs = {**self.llm_args, **kwargs}
+        try:
+            async with llm_rate_limiter_context_manager():
+                return await self.aclient(
+                    model=self.model,
+                    max_retries=2,
+                    messages=[
+                        {
+                            "role": "user",
+                            "content": f"""Use the given format to extract information
                     from the following input: {text_input}. {system_prompt}""",
-                    }
-                ],
-                response_model=response_model,
-            )
+                        }
+                    ],
+                    response_model=response_model,
+                    **merged_kwargs,
+                )
+        except Exception as e:
+            # Same detail-carrying message as the other adapters.
+            raise_if_budget_exhausted(e)
+            raise

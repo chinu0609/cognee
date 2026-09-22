@@ -6,16 +6,23 @@ import asyncio
 import json
 import logging
 from collections import defaultdict
+from collections.abc import Iterable, Mapping
 from pathlib import Path
-from typing import Any, Iterable, List, Mapping
+from typing import Any
+from uuid import UUID, uuid4
 
-from cognee import config, prune, search, SearchType, visualize_graph
-from cognee.low_level import setup, DataPoint
-from cognee.pipelines import run_tasks, Task
-from cognee.tasks.storage import add_data_points
-from cognee.tasks.storage.index_graph_edges import index_graph_edges
+from pydantic import BaseModel
+
+from cognee import SearchType, config, prune, search, visualize_graph
+from cognee.low_level import DataPoint, setup
+from cognee.modules.data.methods import create_authorized_dataset
+from cognee.modules.pipelines.operations import run_pipeline
 from cognee.modules.users.methods import get_default_user
-from cognee.modules.data.methods import load_or_create_datasets
+from cognee.modules.users.models import User
+from cognee.pipelines import Task
+from cognee.tasks.storage import add_data_points
+
+logger = logging.getLogger(__name__)
 
 
 class Person(DataPoint):
@@ -74,18 +81,6 @@ def remove_duplicates_preserve_order(seq: Iterable[Any]) -> list[Any]:
         seen.add(x)
         out.append(x)
     return out
-
-
-def collect_people(payloads: Iterable[Mapping[str, Any]]) -> list[Mapping[str, Any]]:
-    """Collect people from payloads."""
-    people = [person for payload in payloads for person in payload.get("people", [])]
-    return people
-
-
-def collect_companies(payloads: Iterable[Mapping[str, Any]]) -> list[Mapping[str, Any]]:
-    """Collect companies from payloads."""
-    companies = [company for payload in payloads for company in payload.get("companies", [])]
-    return companies
 
 
 def build_people_nodes(people: Iterable[Mapping[str, Any]]) -> dict:
@@ -176,10 +171,10 @@ def attach_employees_to_departments(
         target.employees = employees
 
 
-def build_companies(payloads: Iterable[Mapping[str, Any]]) -> list[Company]:
+def build_companies(data: Data) -> list[Company]:
     """Build company nodes from payloads."""
-    people = collect_people(payloads)
-    companies = collect_companies(payloads)
+    people = data.people
+    companies = data.companies
     people_nodes = build_people_nodes(people)
     groups = group_people_by_department(people)
     dept_names = collect_declared_departments(groups, companies)
@@ -192,19 +187,29 @@ def build_companies(payloads: Iterable[Mapping[str, Any]]) -> list[Company]:
     return result
 
 
-def load_default_payload() -> list[Mapping[str, Any]]:
+class Data(BaseModel):
+    id: UUID
+    companies: list[dict[str, Any]]
+    people: list[dict[str, Any]]
+
+
+def load_default_payload() -> Data:
     """Load the default payload from data files."""
     companies = load_json_file(COMPANIES_JSON)
     people = load_json_file(PEOPLE_JSON)
-    payload = [{"companies": companies, "people": people}]
-    return payload
+
+    data = Data(
+        id=uuid4(),
+        companies=companies,
+        people=people,
+    )
+
+    return data
 
 
-def ingest_payloads(data: List[Any] | None) -> list[Company]:
+def ingest_payloads(data: list[Data]) -> list[Company]:
     """Ingest payloads and build company nodes."""
-    if not data or data == [None]:
-        data = load_default_payload()
-    companies = build_companies(data)
+    companies = build_companies(data[0])
     return companies
 
 
@@ -212,7 +217,7 @@ async def execute_pipeline() -> None:
     """Execute Cognee pipeline."""
 
     # Configure system paths
-    logging.info("Configuring Cognee directories at %s", COGNEE_DIR)
+    logger.info("Configuring Cognee directories at %s", COGNEE_DIR)
     config.system_root_directory(str(COGNEE_DIR))
     ARTIFACTS_DIR.mkdir(parents=True, exist_ok=True)
 
@@ -221,18 +226,17 @@ async def execute_pipeline() -> None:
     await setup()
 
     # Get user and dataset
-    user = await get_default_user()
-    datasets = await load_or_create_datasets(["demo_dataset"], [], user)
-    dataset_id = datasets[0].id
+    user: User = await get_default_user()  # type: ignore
+    dataset = await create_authorized_dataset("demo_dataset", user)
+    data = load_default_payload()
 
     # Build and run pipeline
     tasks = [Task(ingest_payloads), Task(add_data_points)]
-    pipeline = run_tasks(tasks, dataset_id, None, user, "demo_pipeline")
-    async for status in pipeline:
-        logging.info("Pipeline status: %s", status)
+    pipeline = run_pipeline(tasks, [data], [dataset.id], user, "demo_pipeline")
 
-    # Post-process: index graph edges and visualize
-    await index_graph_edges()
+    async for status in pipeline:
+        logger.info("Pipeline status: %s", status)
+
     await visualize_graph(str(GRAPH_HTML))
 
     # Run query against graph
@@ -241,7 +245,7 @@ async def execute_pipeline() -> None:
         query_type=SearchType.GRAPH_COMPLETION,
     )
     result = completion
-    logging.info("Graph completion result: %s", result)
+    logger.info("Graph completion result: %s", result)
 
 
 def configure_logging() -> None:
@@ -258,7 +262,7 @@ async def main() -> None:
     try:
         await execute_pipeline()
     except Exception:
-        logging.exception("Run failed")
+        logger.exception("Run failed")
         raise
 
 
