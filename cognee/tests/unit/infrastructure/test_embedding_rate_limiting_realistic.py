@@ -1,11 +1,12 @@
-import os
-import time
 import asyncio
 import logging
+import os
+import time
 
-from cognee.infrastructure.llm.config import (
-    get_llm_config,
+from cognee.infrastructure.databases.vector.embeddings.config import (
+    get_embedding_config,
 )
+from cognee.shared import rate_limiting
 from cognee.tests.unit.infrastructure.mock_embedding_engine import MockEmbeddingEngine
 
 # Configure logging
@@ -29,10 +30,11 @@ async def test_embedding_rate_limiting_realistic():
     os.environ["DISABLE_RETRIES"] = "true"  # Disable automatic retries for testing
 
     # Clear the config and rate limiter caches to ensure our settings are applied
-    get_llm_config.cache_clear()
+    get_embedding_config.cache_clear()
+    rate_limiting._embedding_rate_limiter = None
 
     # Create a fresh config instance and verify settings
-    config = get_llm_config()
+    config = get_embedding_config()
     logger.info(f"Embedding Rate Limiting Enabled: {config.embedding_rate_limit_enabled}")
     logger.info(
         f"Embedding Rate Limit: {config.embedding_rate_limit_requests} requests per {config.embedding_rate_limit_interval} seconds"
@@ -58,7 +60,7 @@ async def test_embedding_rate_limiting_realistic():
             logger.info(f"Request #{i + 1} succeeded with embedding size: {len(embedding[0])}")
             return True
         except Exception as e:
-            logger.info(f"Request #{i + 1} rate limited: {e}")
+            logger.info(f"Request #{i + 1} rate limited: {e}", exc_info=True)
             return False
 
     # Batch 1: Send 10 concurrent requests (expect 3 to succeed, 7 to be rate limited)
@@ -125,7 +127,7 @@ async def test_embedding_rate_limiting_realistic():
             logger.info(f"Request #{i + 1} succeeded with embedding size: {len(embedding[0])}")
             batch_successes += 1
         except Exception as e:
-            logger.info(f"Request #{i + 1} rate limited: {e}")
+            logger.info(f"Request #{i + 1} rate limited: {e}", exc_info=True)
             batch_rate_limited += 1
 
     batch_end = time.time()
@@ -165,7 +167,8 @@ async def test_with_mock_failures():
     os.environ["DISABLE_RETRIES"] = "true"
 
     # Clear caches
-    get_llm_config.cache_clear()
+    get_embedding_config.cache_clear()
+    rate_limiting._embedding_rate_limiter = None
 
     # Create a mock engine configured to fail every 3rd request
     engine = MockEmbeddingEngine()
@@ -180,15 +183,41 @@ async def test_with_mock_failures():
             text = f"Test text {i}"
             embedding = await engine.embed_text([text])
 
-            logger.info(f"Request #{i + 1} succeeded for {str(embedding)}")
+            logger.info(f"Request #{i + 1} succeeded for {embedding!s}")
         except Exception as e:
-            logger.info(f"Request #{i + 1} failed as expected: {e}")
+            logger.info(f"Request #{i + 1} failed as expected: {e}", exc_info=True)
 
     # Reset environment variables
     os.environ.pop("EMBEDDING_RATE_LIMIT_ENABLED", None)
     os.environ.pop("EMBEDDING_RATE_LIMIT_REQUESTS", None)
     os.environ.pop("EMBEDDING_RATE_LIMIT_INTERVAL", None)
     os.environ.pop("DISABLE_RETRIES", None)
+
+
+def test_embedding_rate_limit_fields_on_embedding_config(monkeypatch):
+    """The embedding rate-limit knobs live on EmbeddingConfig and read their env vars."""
+    monkeypatch.setenv("EMBEDDING_RATE_LIMIT_ENABLED", "true")
+    monkeypatch.setenv("EMBEDDING_RATE_LIMIT_REQUESTS", "7")
+    get_embedding_config.cache_clear()
+    try:
+        cfg = get_embedding_config()
+        assert cfg.embedding_rate_limit_enabled is True
+        assert cfg.embedding_rate_limit_requests == 7
+    finally:
+        get_embedding_config.cache_clear()
+
+
+def test_llm_config_no_longer_defines_embedding_rate_limit_fields():
+    """The knobs were moved out of LLMConfig, leaving a single source of truth."""
+    from cognee.infrastructure.llm.config import LLMConfig
+
+    for field in (
+        "embedding_rate_limit_enabled",
+        "embedding_rate_limit_requests",
+        "embedding_rate_limit_interval",
+        "embedding_rate_limit_tokens",
+    ):
+        assert field not in LLMConfig.model_fields
 
 
 if __name__ == "__main__":
