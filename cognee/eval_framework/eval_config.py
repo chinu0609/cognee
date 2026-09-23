@@ -55,6 +55,19 @@ class EvalConfig(BaseSettings):
     direct_llm_eval_prompt: str = "direct_llm_eval_prompt.txt"
     instance_filter: list[str] | None = None
 
+    # Cognee LLM + embedding used for corpus cognify and answer generation.
+    # These mirror the main cognee env vars so the eval run's config.json records
+    # exactly which models were in use — set them in .env as usual.
+    llm_model: str = "openai/gpt-4o-mini"
+    llm_provider: str = "openai"
+    embedding_provider: str = "fastembed"
+    embedding_model: str = "BAAI/bge-small-en-v1.5"
+
+    # Jev (TypeSafe AI) eval engine config
+    jev_api_key: str | None = None
+    jev_api_endpoint: str = "https://api.typesafe.ai/v1/systemone"
+    jev_model: str = "jev-latest"
+
     model_config = SettingsConfigDict(env_file=".env", extra="allow")
 
     def to_dict(self) -> dict:
@@ -83,6 +96,13 @@ class EvalConfig(BaseSettings):
             "direct_llm_system_prompt": self.direct_llm_system_prompt,
             "direct_llm_eval_prompt": self.direct_llm_eval_prompt,
             "instance_filter": self.instance_filter,
+            "llm_model": self.llm_model,
+            "llm_provider": self.llm_provider,
+            "embedding_provider": self.embedding_provider,
+            "embedding_model": self.embedding_model,
+            "jev_api_key": self.jev_api_key,
+            "jev_api_endpoint": self.jev_api_endpoint,
+            "jev_model": self.jev_model,
         }
 
 

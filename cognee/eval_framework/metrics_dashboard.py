@@ -7,8 +7,35 @@ import plotly.graph_objects as go
 metrics_fields = {
     "contextual_relevancy": ["question", "retrieval_context"],
     "context_coverage": ["question", "retrieval_context", "golden_context"],
+    "jev_correctness": ["question", "answer", "golden_answer"],
 }
 default_metrics_fields = ["question", "answer", "golden_answer"]
+
+
+def create_jev_correctness_chart(metrics_data: list[dict]) -> str | None:
+    """Pie chart of correct vs incorrect verdicts from the Jev engine."""
+    correct_count = 0
+    incorrect_count = 0
+    for entry in metrics_data:
+        jev = entry.get("metrics", {}).get("jev_correctness", {})
+        if jev.get("correct") is True:
+            correct_count += 1
+        elif jev.get("correct") is False:
+            incorrect_count += 1
+
+    if correct_count + incorrect_count == 0:
+        return None
+
+    fig = go.Figure(
+        go.Pie(
+            labels=["Correct", "Incorrect"],
+            values=[correct_count, incorrect_count],
+            marker_colors=["#2ca02c", "#d62728"],
+            textinfo="label+percent+value",
+        )
+    )
+    fig.update_layout(title="Jev Correctness Verdict", template="seaborn")
+    return fig.to_html(full_html=False)
 
 
 def create_distribution_plots(metrics_data: dict[str, list[float]]) -> list[str]:
@@ -158,8 +185,12 @@ def create_dashboard(
         }
     )
 
+    # Add Jev yes/no verdict chart when present
+    jev_chart = create_jev_correctness_chart(metrics_data)
+    extra_figures = [jev_chart] if jev_chart else []
+
     # Combine all figures
-    figures = distribution_figures + [ci_plot]
+    figures = distribution_figures + extra_figures + [ci_plot]
 
     # Generate HTML components
     details_html = generate_details_html(metrics_data)

@@ -31,6 +31,12 @@ class EvaluatorAdapter(Enum):
         "DirectLLMEvalAdapter",
         None,
     )
+    JEV = (
+        "Jev",
+        "cognee.eval_framework.evaluation.jev_eval_adapter",
+        "JevEvalAdapter",
+        None,
+    )
 
     def __new__(cls, adapter_name: str, module_path: str, class_name: str, extra: str | None):
         obj = object.__new__(cls)

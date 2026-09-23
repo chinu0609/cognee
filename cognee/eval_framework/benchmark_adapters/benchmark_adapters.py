@@ -7,6 +7,7 @@ from cognee.eval_framework.benchmark_adapters.logistics_system_adapter import (
     LogisticsSystemAdapter,
 )
 from cognee.eval_framework.benchmark_adapters.musique_adapter import MusiqueQAAdapter
+from cognee.eval_framework.benchmark_adapters.squad_adapter import SQuADAdapter
 from cognee.eval_framework.benchmark_adapters.twowikimultihop_adapter import TwoWikiMultihopAdapter
 
 
@@ -15,6 +16,7 @@ class BenchmarkAdapter(Enum):
     HOTPOTQA = ("HotPotQA", HotpotQAAdapter)
     LOGISTICSSYSTEM = ("LogisticsSystem", LogisticsSystemAdapter)
     MUSIQUE = ("Musique", MusiqueQAAdapter)
+    SQUAD = ("SQuAD", SQuADAdapter)
     TWOWIKIMULTIHOP = ("TwoWikiMultiHop", TwoWikiMultihopAdapter)
     BEAM = ("BEAM", BEAMAdapter)
 

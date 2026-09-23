@@ -41,6 +41,7 @@ ARTIFACT_KEYS = (
 ENGINE_CHOICES = {
     "deepeval": "DeepEval",
     "direct_llm": "DirectLLM",
+    "jev": "Jev",
 }
 
 
@@ -298,8 +299,8 @@ def config_from_namespace(args: argparse.Namespace) -> EvalConfig:
 
     config = EvalConfig(**overrides)
 
-    # DirectLLM only scores 'correctness', so pin the metrics list to it.
-    if config.evaluation_engine == "DirectLLM":
+    # DirectLLM and Jev only score 'correctness', so pin the metrics list to them.
+    if config.evaluation_engine in ("DirectLLM", "Jev"):
         config.evaluation_metrics = ["correctness"]
 
     return config

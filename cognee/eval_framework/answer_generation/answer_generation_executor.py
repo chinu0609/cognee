@@ -2,6 +2,7 @@ from typing import Any
 
 from cognee.modules.retrieval.base_retriever import BaseRetriever
 from cognee.modules.retrieval.completion_retriever import CompletionRetriever
+from cognee.modules.retrieval.only_context_prompt import build_only_context_prompt
 from cognee.modules.retrieval.graph_completion_context_extension_retriever import (
     GraphCompletionContextExtensionRetriever,
 )
@@ -39,6 +40,17 @@ class AnswerGeneratorExecutor:
                 query=query_text, retrieved_objects=retrieved_objects, context=retrieval_context
             )
 
+            # Capture the full LLM input (user + system prompts) for Jev evaluation.
+            # build_only_context_prompt returns None for non-generative retrievers or
+            # when retrieval found nothing — both are handled gracefully below.
+            prompt_pair = await build_only_context_prompt(
+                retriever,
+                query=query_text,
+                context=retrieval_context,
+            )
+            jev_user_prompt = prompt_pair[0] if prompt_pair else None
+            jev_system_prompt = prompt_pair[1] if prompt_pair else None
+
             ############
             if isinstance(search_results, str):
                 search_results = [search_results]
@@ -48,6 +60,8 @@ class AnswerGeneratorExecutor:
                 "answer": search_results[0],
                 "golden_answer": correct_answer,
                 "retrieval_context": retrieval_context,
+                "jev_user_prompt": jev_user_prompt,
+                "jev_system_prompt": jev_system_prompt,
             }
 
             if "golden_context" in instance:
